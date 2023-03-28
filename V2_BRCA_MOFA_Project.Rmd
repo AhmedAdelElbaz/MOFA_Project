@@ -1,0 +1,2630 @@
+---
+title: "BRCA_MOFA_Project"
+author: "MODA_TEAM"
+date: '2023-03-24'
+output: html_document
+---
+
+This project involved the analysis of breast cancer data derived from the
+TCGA-BRCA project using R. Multi-omics data (RNAseq STAR counts data, microRNA data proteomics and clinical data) of (495 primary solid) tumor samples was downloaded and processed using TCGABiolinks R package. The RNAseq data were divided into two matrices, one for the long noncoding RNAs and one for the mRNA.
+
+To prepare the dataests for MOFA algorithm, we started with features quality control, normalization, and scaling. MOFA2 (Multi- Omics Factor Analysis) R package was used for multi-omics data integration, which uses an unsupervised approach to discover the patterns that drive variation across different molecular layers. Features included in MOFA analysis were (2281 for mRNA, 1572 for miRNA, 378 for Proteome and lncRNA for 2228).
+
+To identify differentially enriched pathways, biological processes and functions, gene set enrichment analysis was performed for mRNA and Proteome using REACTOME and C5(GO: BP) from MSIGDB. On the other hand, overrepresentation analysis (ORA) was conducted on the miRNA and lncRNA. First, differential expression analysis was performed using DESeq2 Package, and the samples were grouped based on their position in factor one of MOFA, positive and negative groups. Then, ORA was performed using TAM-2 tools for miRNA and PANTHER web tool for lncRNA. The ORA analysis used REACTOME, GO: BP, and GO: MF.
+
+
+#Set Working Directory
+```{r eval=FALSE, include=FALSE}
+setwd("D:/MAIN/STUDY/PROGRAMMING/R/V2_BRCA_MOFA_PROJECT")
+```
+#Libraries
+```{r message=FALSE, warning=FALSE}
+library(readxl)
+library(readr)
+library(vsn)
+library(DESeq2)
+library(tidyverse)
+library(ComplexHeatmap)
+library(ggfortify)
+library(umap)
+library(ggplot2)
+library(ggrepel)
+library(TCGAbiolinks)
+library(ComplexUpset)
+library(ggupset)
+library(openxlsx)
+```
+
+##Loading MetaData & Samples
+
+In this section we loaded the Samples from TCGA database Link: (https://portal.gdc.cancer.gov/) using the TCGAbiolinks package Link: (https://bioconductor.org/packages/release/bioc/html/TCGAbiolinks.html)
+
+#MetaData
+```{r}
+RNA_TCGA <- read.delim("Sample_Sheets/RNA_SampleSheet.tsv" )
+miRNA_TCGA <- read.delim("Sample_Sheets/miRNA_SampleSheet.tsv" )
+Methylation_TCGA <- read.delim("Sample_Sheets/Methylation_SampleSheet.tsv" )
+Protein_TCGA <- read.delim("Sample_Sheets/Protein_SampleSheet.tsv" )
+```
+We Found 1207 , 919 and 1231 TCGA-BRCA Samples in miRNA , Protein and RNA databases respectively. To figure out the common samples w did the following steps..
+```{r}
+Intersect_RNA_miRNA <- intersect(RNA_TCGA$Case.ID , miRNA_TCGA$Case.ID )
+Intersect_Meth_Prot <- intersect(Methylation_TCGA$Case.ID , Protein_TCGA$Case.ID)
+barcodes <- intersect(Intersect_RNA_miRNA , Intersect_Meth_Prot)
+```
+629 Samples have all the four omics. By Sample ID we will subset the Omics metadata
+```{r}
+df <- data.frame(Case.ID = barcodes)
+dim(df)
+```
+
+```{r}
+#Subsetting the Common Samples from the BulkRNA Samples
+RNA_Samples <- RNA_TCGA[which(RNA_TCGA$Case.ID %in% df$Case.ID),]
+table(RNA_Samples$Sample.Type)
+barplot(table(RNA_Samples$Sample.Type) , space = 0 , horiz = F, main = "RNA Sample Types")
+```
+640 Primary Tumor Samples are our target, and this indicates that there are some patients have more than one sample and others have metastatic and adjasent normal extracted samples. 
+```{r}
+#Subsetting the Common Samples from the miRNA Samples
+miRNA_Samples <- miRNA_TCGA[which(miRNA_TCGA$Case.ID %in% df$Case.ID),]
+table(miRNA_Samples$Sample.Type)
+barplot(table(miRNA_Samples$Sample.Type) , space = 0 , horiz = F , main = "mi-RNA Sample Types")
+```
+639 Primary Tumor Samples are our target, and this indicates that there are some patients have more than one sample and others have metastatic and adjasent normal extracted samples. 
+```{r}
+#Subsetting the Common Samples from the Protein Samples
+Protein_Samples <- Protein_TCGA[which(Protein_TCGA$Case.ID %in% df$Case.ID),]
+table(Protein_Samples$Sample.Type)
+barplot(table(Protein_Samples$Sample.Type) , space = 0 , horiz = F , main = "Protein Sample Types")
+```
+629 Primary Tumor Samples are our target, and this indicates that there are some patients have more than one sample and others have metastatic and adjasent normal extracted samples. 
+
+#Load Metadata
+```{r}
+load('metaData')
+```
+
+#Upset Plot
+```{r}
+#Upset plot
+upset_list <- list()
+for(sample in unique(Clinical_data_ann$bcr_patient_barcode)){
+  exist <- c()
+  if (sample %in% unique(RNA_TCGA$Case.ID)){
+    exist <- c(exist, 'BulkRNA')
+  }
+  if(sample %in% unique(Protein_TCGA$Case.ID)){
+    exist <- c(exist, 'Protein')
+  }
+  if(sample %in% unique(Methylation_TCGA$Case.ID)){
+    exist <- c(exist, 'Methylation')
+  }
+  if(sample %in% unique(miRNA_TCGA$Case.ID)){
+    exist <- c(exist, 'miRNA')
+  }else{
+    exist <- c(exist, NA)
+  }
+  upset_list[[sample]] <- exist
+}
+upset_tibble <- data.frame(sample = unique(Clinical_data_ann$bcr_patient_barcode))
+upset_tibble <- as_tibble(upset_tibble)
+upset_tibble$list <- upset_list
+```
+
+```{r}
+upset_tibble %>% ggplot(aes(x=list)) +
+  geom_bar() +
+  xlab('Omics Type')+
+  scale_x_upset(n_intersections = 10)+
+  scale_x_mergelist(sep = "-") +
+  axis_combmatrix(sep = "-") +
+  scale_x_upset(order_by = "freq")
+```
+Only 629 Samples has four Omics, However the samples which will be included in the analysis will be further sub-setted because the selected metdata lacks some info about the breast cancer subtypes of some samples.
+
+```{r}
+rm(upset_list , upset_tibble , df , Methylation_TCGA , miRNA_TCGA , RNA_TCGA , Protein_TCGA)
+rm(exist , Intersect_Meth_Prot , Intersect_RNA_miRNA , sample)
+```
+
+Save those Common Samples as txt format
+```{r}
+#Save the Samples as txt file 
+write.table(barcodes, 'Common_Samples.txt' , quote = F , row.names = F , col.names = F)
+```
+```{r}
+metadata <- Clinical_data_ann
+```
+
+rename rows of metadata by sample IDs for further sub-setting
+```{r}
+row.names(metadata) <- metadata$bcr_patient_barcode
+```
+
+We sub-setted the metadata to only 628 samples as one of the 629 is not avilable in this metadata
+```{r}
+indexes=match(barcodes,rownames(metadata))
+indexes= indexes[!is.na(indexes)]
+metadata <- metadata[indexes , ]
+```
+
+Explore Breast Cancer sub-types
+```{r}
+
+barplot(table(metadata$IMS), main = "Breast Cancer Subtypes in selected Samples")
+```
+This Barplot shows that selected samples include: Four breast cancer sub-types (Basal: 129 samples , Her2: 91 samples , LumA: 197 samples , LumB: 130 samples)
+
+Check if all samples are included in each Omic metadata
+```{r}
+sum(metadata$bcr_patient_barcode %in% RNA_Samples$Case.ID)
+sum(metadata$bcr_patient_barcode %in% miRNA_Samples$Case.ID)
+sum(metadata$bcr_patient_barcode %in% Protein_Samples$Case.ID)
+```
+
+#BulkRNA
+
+We used TCGAbiolinks with following arguments to download the selected 628 Bulk-RNA data from GDC database
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+#Create the selected samples query
+BulkRNA_query <- GDCquery(project = 'TCGA-BRCA',
+                          data.category = 'Transcriptome Profiling',
+                          data.type = 'Gene Expression Quantification',
+                          sample.type = 'Primary Tumor',
+                          barcode = barcodes)
+#Download the samples files
+GDCdownload(BulkRNA_query)
+```
+
+Read the downloaded files to form the Gene expression matrix
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+##### load the mRNA-Seq data #####
+data.path="GDCdata/TCGA-BRCA/harmonized/Transcriptome_Profiling/Gene_Expression_Quantification"
+files <- list.files(path=data.path,recursive=T, pattern = "tsv")
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+file=files[1]
+filepath=file.path(data.path,files[1])
+colnames= unlist( strsplit ( readLines(filepath ,n=2) [2] ,"\t"))
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+temp <- read.table(filepath, header=F,skip = 6)
+names(temp)=colnames
+head(temp)
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+exp=temp[,c(1,2,3)]
+
+for(i in 1: length(files))
+{
+  file=files[i]
+  file.id=strsplit(file,"/")[[1]][1]
+  filepath=file.path(data.path,files[i])
+  temp <- read.table(filepath, header=F,skip = 6)
+  colnames(temp)[4]=file.id
+  exp=cbind(exp,temp[4])
+}
+head(exp)
+```
+
+Select only protein coding transcripts
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+exp_pc <- exp%>%filter(gene_type == "protein_coding")
+```
+
+Check for duplicated transcripts that corresponds to the same gene
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+# check duplciation of of gene symbols?  
+x=duplicated(exp_pc$gene_name)  
+sum(x)
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+exp.data=exp_pc[,4:dim(exp_pc)[2]]
+exp.data=apply(exp.data,2, as.numeric)
+head(exp.data)
+```
+
+Remove Duplication by aggregation of the duplicated transcripts by taking there mean value expression into one gene
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+#### remove  duplication by aggregation
+exp.data.agg= aggregate(exp.data, list(exp_pc$gene_name),FUN=mean)
+rownames(exp.data.agg)=exp.data.agg$Group.1
+exp.data.agg=exp.data.agg[-1]
+exp.data.agg=round(exp.data.agg)
+file.ids=colnames(exp.data.agg)
+View(exp.data.agg)
+```
+
+We renamed the samples with there TCGA sample ID instead of the file IDs
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+###### load the mrna sample sheets  # sample sheets
+pheno <- RNA_Samples
+View(pheno)
+colnames(pheno) = sub(" " , "." , colnames(pheno))
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+file.ids.pheno=pheno$File.ID
+index.files=match(file.ids,file.ids.pheno)
+
+pheno <- pheno[index.files, ]
+table(pheno$`Sample.Type`)
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+file.ids.pheno=pheno$`File.ID`
+index.files=match(file.ids,file.ids.pheno)
+names(exp.data.agg)=pheno$Case.ID[index.files]
+```
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+BulkRNA.data <- exp.data.agg[,metadata$bcr_patient_barcode]
+```
+We saved the read-count expression matrix as RDATA file
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+save(BulkRNA.data , file = "BulkRNA.data.RDATA")
+```
+Load
+```{r}
+load("BulkRNA.data.RDATA")
+```
+
+we filtered Genes with zero variance across all samples to reduce dimensions of the Genes that have no variance explaining the difference between breast cancer sub types
+```{r}
+genesVariance <- as.data.frame( apply( BulkRNA.data, 
+                                       MARGIN = 1 , 
+                                       var , 
+                                       simplify = T))
+names(genesVariance) = 'Variance'
+vFilterGenes <- genesVariance %>% filter(Variance > 0 )
+vFilterGenes <- row.names(vFilterGenes)
+BulkRNA.data <- BulkRNA.data[vFilterGenes, ]
+```
+
+remove low quality genes (i.e. genes that have total expression lower than 10 in all 628 samples)
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+keep <- rowSums(BulkRNA.data) >= 10
+BulkRNA.data <- BulkRNA.data[keep,]
+```
+We estimated size factors and variance stabilization transformation
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+dds = DESeqDataSetFromMatrix( countData = BulkRNA.data, 
+                              colData = metadata , 
+                              design = ~gender)
+
+dds <- estimateSizeFactors(dds)
+dds <- varianceStabilizingTransformation(dds)
+ntd <- assay(dds)
+View(ntd)
+```
+```{r}
+hist(genesVariance$Variance)
+```
+
+Filter genes with highest variance according to specific variance cut-off extracted from the shown histogram
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+Variance_Cutoff <- 15e+6
+vFilterGenes <- genesVariance %>% arrange(desc(Variance)) %>% filter(Variance >= Variance_Cutoff)
+vFilterGenes <- row.names(vFilterGenes)
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+ntd <- ntd[vFilterGenes,]
+```
+Log2 Normalization was done to normalize the data 
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+BulkRNA.data.log= log2(ntd + 1)
+```
+we Scaled the matrix by Genes to be ready for linear combination model by MOFA
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+BulkRNA.data.log.scale <- scale(t(BulkRNA.data.log) , center = TRUE, scale = TRUE)
+BulkRNA.data.log.scale <- as.data.frame(t(BulkRNA.data.log.scale))
+```
+
+We saved the normalized and scaled gene expression matrix to RDATA file
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+save(BulkRNA.data.log , BulkRNA.data.log.scale , metadata , file = "BulkRNA.data_.RDATA")
+```
+Load
+```{r}
+load("BulkRNA.data_.RDATA")
+```
+
+Draw Plots of the data before and after normalization and scaling
+```{r}
+options(repr.plot.width=20,repr.plot.height=8)
+
+par(mar = c(8,5,2,2),mfrow=c(1,3),cex.axis=1.5)
+plot(density(apply(BulkRNA.data, 2, mean, na.rm = TRUE)),main='befor log2')
+plot(density(apply(BulkRNA.data.log, 2, mean, na.rm = TRUE)),main='after log2')
+plot(density(apply(BulkRNA.data.log.scale, 2, mean, na.rm = TRUE)),main='after log2 + scale')
+```
+We saved the read-count gene expression matrix to be used for selecting long non-coding RNA
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+save(exp , RNA_Samples , file = "ln_material.RDATA")
+```
+```{r}
+load("ln_material.RDATA")
+```
+
+#miRNA
+We used TCGAbiolinks with following arguments to download the selected 628 mi-RNA data from GDC database
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+miRNA_query <- TCGAbiolinks::GDCquery(project = 'TCGA-BRCA',
+                                      data.category = 'Transcriptome Profiling',
+                                      data.type = 'miRNA Expression Quantification',
+                                      sample.type = 'Primary Tumor',
+                                      barcode = barcodes)
+
+GDCdownload(miRNA_query)
+```
+
+Read the downloaded files to form the miRNA expression matrix
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+data.path="GDCdata/TCGA-BRCA/harmonized/Transcriptome_Profiling/miRNA_Expression_Quantification"
+files <- list.files(path=data.path,recursive=T, pattern = "txt")
+file=files[1]
+filepath=file.path(data.path,files[1])
+colnames= unlist( strsplit ( readLines(filepath ,n=2) [1] ,"\t"))
+temp <- read.table(filepath, header=T)
+exp_mi=temp[,c(1)]
+for(i in 1: length(files))
+{
+  file=files[i]
+  file.id=strsplit(file,"/")[[1]][1]
+  filepath=file.path(data.path,files[i])
+  temp <- read.table(filepath, header=T)
+  colnames(temp)[2]=file.id
+  exp_mi=cbind(exp_mi,temp[2])
+}
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+row.names(exp_mi) = exp_mi$exp_mi
+exp_mi = exp_mi[-1]
+```
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+file.ids=colnames(exp_mi)
+
+#miRNA.data = exp_mi
+file.ids.pheno=miRNA_Samples$File.ID
+index.files=match(file.ids,file.ids.pheno)
+names(exp_mi)=miRNA_Samples$Case.ID[index.files]
+miRNA.data=exp_mi
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+indexes=match(metadata$bcr_patient_barcode,colnames(miRNA.data))
+indexes= indexes[!is.na(indexes)]
+miRNA.data <- miRNA.data[,indexes]
+```
+
+We saved the read count miRNA expression matrix as RDATA file
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+save(miRNA.data , file = "miRNA.data.RDATA")
+```
+Load
+```{r}
+load("miRNA.data.RDATA")
+```
+
+We removed miRNA features with zero variance
+```{r}
+miRNAVariance <- as.data.frame( apply( miRNA.data, 
+                                       MARGIN = 1 , 
+                                       var , 
+                                       simplify = T))
+names(miRNAVariance) = 'Variance'
+vFiltermiRNA <- miRNAVariance %>% filter(Variance > 0 )
+vFiltermiRNA <- row.names(vFiltermiRNA)
+
+miRNA.data <- miRNA.data[vFiltermiRNA, ]
+```
+
+We calculated the estimated size factors and variane stabilizing transformation for removing of the biological and techniqal sequencing errors
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+dds = DESeqDataSetFromMatrix( countData = miRNA.data, 
+                              colData = metadata[colnames(miRNA.data),], 
+                              design = ~gender)
+
+dds <- estimateSizeFactors(dds)
+dds <- varianceStabilizingTransformation(dds)
+ntd <- assay(dds)
+```
+
+we log normalized the miRNA expression matrix
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+miRNA.data.log= log2(ntd + 1)
+```
+We scaled the miRNA normalized expression matrix by feature to be introduced to MOFA
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+miRNA.data.log.scale <- scale(t(miRNA.data.log) , center = TRUE, scale = TRUE)
+miRNA.data.log.scale <- as.data.frame(t(miRNA.data.log.scale))
+```
+
+We saved the normalized and scaled matrices as RDATA file
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+save(miRNA.data.log , miRNA.data.log.scale , metadata , file = "miRNA.data_.RDATA")
+```
+Load
+```{r}
+load("miRNA.data_.RDATA")
+```
+
+
+```{r}
+options(repr.plot.width=20,repr.plot.height=8)
+
+par(mar = c(8,5,2,2),mfrow=c(1,3),cex.axis=1.5)
+plot(density(apply(miRNA.data, 2, mean, na.rm = TRUE)),main='befor log2')
+plot(density(apply(miRNA.data.log, 2, mean, na.rm = TRUE)),main='after log2')
+plot(density(apply(miRNA.data.log.scale, 2, mean, na.rm = TRUE)),main='after log2 + scale')
+```
+
+
+#lnRNA
+We filtered the read count gene expression matrix for only lnc RNA
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+exp_lnc <- exp%>%filter(gene_type == "lncRNA")
+```
+
+We checked for duplicated transcripts
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+# check duplciation   
+x=duplicated(exp_lnc$gene_name)  
+sum(x)
+```
+
+We aggregated the duplicated transcripts by taking there mean values
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+exp.data=exp_lnc[,4:dim(exp_lnc)[2]]
+exp.data=apply(exp.data,2, as.numeric)
+View(exp.data)
+```
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+#### remove  duplication by aggregation
+exp.data.agg= aggregate(exp.data, list(exp_lnc$gene_name),FUN=mean)
+rownames(exp.data.agg)=exp.data.agg$Group.1
+exp.data.agg=exp.data.agg[-1]
+exp.data.agg=round(exp.data.agg)
+file.ids=colnames(exp.data.agg)
+View(exp.data.agg)
+```
+
+We renamed the lncRNA expression matrix by sample IDs instead of File IDs
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+###### load the mrna sample sheets  # sample sheets
+pheno <- RNA_Samples
+View(pheno)
+colnames(pheno) = sub(" " , "." , colnames(pheno))
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+file.ids.pheno=pheno$File.ID
+index.files=match(file.ids,file.ids.pheno)
+
+pheno <- pheno[index.files, ]
+table(pheno$`Sample.Type`)
+```
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+file.ids.pheno=pheno$`File.ID`
+index.files=match(file.ids,file.ids.pheno)
+names(exp.data.agg)=pheno$Case.ID[index.files]
+```
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+lncRNA.data <- exp.data.agg[,metadata$bcr_patient_barcode]
+```
+Load
+```{r}
+load("lncRNA.data_.RDATA")
+```
+
+We removed the lncRNA features with zero variance
+```{r}
+lncRNAVariance <- as.data.frame( apply( lncRNA.data, 
+                                       MARGIN = 1 , 
+                                       var , 
+                                       simplify = T))
+names(lncRNAVariance) = 'Variance'
+vFilterlncRNA <- lncRNAVariance %>% filter(Variance > 0 )
+vFilterlncRNA <- row.names(vFilterlncRNA)
+lncRNA.data <- lncRNA.data[vFilterlncRNA, ]
+```
+
+We estimated the size factors and calculated the variance stabilizing transformation
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+dds = DESeqDataSetFromMatrix( countData = lncRNA.data, 
+                              colData = metadata , 
+                              design = ~race)
+
+dds <- estimateSizeFactors(dds)
+dds <- varianceStabilizingTransformation(dds)
+ntd <- assay(dds)
+```
+We selected the lncRNA features with highest variance according to specific cut-off to be with suitable dimension while running MOFA algorism
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+Variance_Cutoff <- 2000
+vFilterlncRNA <- lncRNAVariance %>% arrange(desc(Variance)) %>% filter(Variance >= Variance_Cutoff)
+vFilterlncRNA <- row.names(vFilterlncRNA)
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+ntd <- ntd[vFilterlncRNA,]
+```
+We normalized the lnRNA expression matrix after filtration
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+lncRNA.data.log= log2(ntd + 1)
+```
+We scaled the matrix by features 
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+lncRNA.data.log.scale <- scale(t(lncRNA.data.log) , center = TRUE, scale = TRUE)
+lncRNA.data.log.scale <- as.data.frame(t(lncRNA.data.log.scale))
+```
+We saved the lnRNA normalized and scaled data to RDATA file
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+save(lncRNA.data , lncRNA.data.log , lncRNA.data.log.scale , file = "lncRNA.data_.RDATA")
+```
+
+
+```{r}
+options(repr.plot.width=20,repr.plot.height=8)
+
+par(mar = c(8,5,2,2),mfrow=c(1,3),cex.axis=1.5)
+plot(density(apply(lncRNA.data, 2, mean, na.rm = TRUE)),main='befor log2')
+plot(density(apply(lncRNA.data.log, 2, mean, na.rm = TRUE)),main='after log2')
+plot(density(apply(lncRNA.data.log.scale, 2, mean, na.rm = TRUE)),main='after log2 + scale')
+```
+
+#Proteins
+We created GDCquery for protein samples by using TCGAbiolinks R package
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+query <- GDCquery(project = "TCGA-BRCA",
+                      data.category = "Proteome Profiling",
+                      access = "open",
+                      legacy = FALSE,
+                       barcode = barcodes,
+                      platform = "RPPA",
+                      data.type = "Protein Expression Quantification" ,
+                      sample.type =  "Primary Tumor")
+                      
+View(getResults(query))
+```
+
+we run GDC download and prepare to form the protein expression matrix
+```{r eval=FALSE, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+
+GDCdownload(query)
+            
+```
+We saved the normalized and scaled protein matrix as RDATA file
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+Protein.data.log.scale <- GDCprepare (query, save.filename =  "RPPA_TCGA-BRCA", save = TRUE)
+save(Protein.data.log.scale, file = "Protein.data.log.scale_.RDATA")
+```
+As each feature in the protein matrix is protein ID we annotated each feature into Gene ID for further enrichment analysis by using AGID annotation data base to select the corresponding gene name
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+# read the loaded annotation for AGID
+AGID <- read_delim("AGID.tsv", delim = "\t", escape_double = FALSE, 
+                               trim_ws = TRUE)
+AGID_ <- AGID %>% select(AGID , gene_name)
+#1. set AGID name to one gene 
+AGID_$gene_name<- sub ("/.*", "", AGID_$gene_name)
+#2. set rowname for RPPA
+Protein.data.log.scale<- merge(Protein.data.log.scale , AGID_ , by= "AGID")
+```
+We removed the duplicated gene names by taking their mean values
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+Protein.data.log.scale=Protein.data.log.scale[,6:dim(Protein.data.log.scale)[2]]
+Protein.data.log.scale_num=apply(Protein.data.log.scale,2, as.numeric)
+View(Protein.data.log.scale_num)
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+#### remove  duplication by aggregation
+Protein.data.log.scale_agg= aggregate(Protein.data.log.scale_num, list(Protein.data.log.scale$gene_name),FUN=mean)
+Protein.data.log.scale_agg <- Protein.data.log.scale_agg[-dim(Protein.data.log.scale_agg)[2]]
+rownames(Protein.data.log.scale_agg)=Protein.data.log.scale_agg$Group.1
+Protein.data.log.scale_agg=Protein.data.log.scale_agg[-1]
+View(Protein.data.log.scale_agg)
+```
+We Ckecked the protein feature variances
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+num.mat <- as.matrix( Protein.data.log.scale_agg)
+```
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+vars<-  rowVars(num.mat, na.rm = TRUE) 
+```
+We Detectd variances equal to zero or NA, and remove them from the main matrix
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+zero_var<- which( vars== 0 | is.na(vars))
+length (zero_var)
+ sum (vars == 0) 
+```
+Now we have 22 feature with zero variance
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+num.mat<- num.mat[ - zero_var, ]
+```
+Missings imputation
+We Computed all missinigness rate in proteins
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+#all_elmnts
+nrow(num.mat) * ncol(num.mat)
+# NAs_elmnts
+sum(is.na(num.mat))
+# # all missingness percentage
+sum(is.na(num.mat))/(nrow(num.mat) * ncol(num.mat))
+
+round(sum(is.na(num.mat))/(nrow(num.mat) * ncol(num.mat)) *100,1)
+```
+so data  with 7.6 missing data
+
+we Computed missinigness rate in each feature
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+missd_features<- rowSums( is.na(num.mat))/ nrow(num.mat)*100
+sum (missd_features> 50)
+quantile(missd_features)
+```
+
+We visulalized missings rates
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+## draw histogram for missingness rate for each feature
+h=hist( missd_features,
+        breaks=10,
+        main="",
+        xlab="percentage of missingness")
+# add counts to each break
+text(h$mids,h$counts,labels=h$counts, adj=c(0.5, -0.5))
+# the cutoff will be 50%
+abline(v = 50)
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+good.inx=apply(is.na(num.mat), 1, sum)/ncol(num.mat) <0.2
+sum(good.inx)
+num.mat.good<- num.mat[good.inx, ]
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+library(impute)
+```
+
+Here we have no samples with more than 50% missing rate
+we imputed missingness by K nearest neighbour algorism by using impute.knn function fro impute R package
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+num.mat.imputed<- impute.knn(num.mat.good)$data
+```
+
+Confirm that we dot have missed data
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+sum (rowSums(is.na(num.mat.imputed)))
+```
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+Protein.data.log.scale <- num.mat.imputed
+Protein.data.log.scale <- scale(t(Protein.data.log.scale) , center = TRUE, scale = TRUE)
+Protein.data.log.scale <- as.data.frame(t(Protein.data.log.scale))
+```
+We renamed the samples with sample IDs
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+col_names <- c() 
+for(name in colnames(Protein.data.log.scale)){
+  x <- str_split(name , pattern = "-")
+  X <- paste0(x[[1]][1] ,"-" ,x[[1]][2],"-" , x[[1]][3])
+  col_names = c(col_names , X)
+}
+colnames(Protein.data.log.scale) <- col_names
+```
+We saved the normalized and scaled protein matrix as RDATA file
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+save(Protein.data.log.scale , file = "Protein_data_.RDATA")
+```
+Load
+```{r}
+load("Protein_data_.RDATA")
+```
+
+
+#MOFA
+Further sub-setting for the matrices will be through samples which are corresponding to breast cancer sub-types from the metadata (not adjacent normal samples)
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+FilteredMetaData <- as.data.frame(metadata %>% filter (IMS != 'Normal' & !is.na(IMS)))
+FilteredMetaData <- FilteredMetaData[colnames(miRNA.data.log.scale),]
+FilteredMetaData <- FilteredMetaData[complete.cases(FilteredMetaData),]
+table(FilteredMetaData$IMS)
+```
+
+We Sub-setted the four matrices and prepared them for MOFA
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+miRNA <- miRNA.data.log.scale[,row.names(FilteredMetaData)]
+miRNA_row.names <- row.names(miRNA)
+miRNA <- apply(miRNA,2, as.numeric)
+row.names(miRNA) = miRNA_row.names
+
+RNA <- BulkRNA.data.log.scale[,row.names(FilteredMetaData)]
+RNA_row.names <- row.names(RNA)
+RNA <- apply(RNA,2, as.numeric)
+row.names(RNA) = RNA_row.names
+
+lncRNA <- lncRNA.data.log.scale[,row.names(FilteredMetaData)]
+lncRNA_row.names <- row.names(lncRNA)
+lncRNA <- apply(lncRNA,2, as.numeric)
+row.names(lncRNA) = lncRNA_row.names
+
+Protein <- Protein.data.log.scale[,row.names(FilteredMetaData)]
+Protein_row.names <- row.names(Protein)
+Protein <- apply(Protein,2, as.numeric)
+row.names(Protein) = Protein_row.names
+```
+```{r message=FALSE, warning=FALSE}
+library(MOFA2)
+library(MOFAdata)
+library(data.table)
+```
+Load the MOFA Object
+```{r}
+load('MOFA_BRCA.RDATA')
+```
+upload the matrices to a list
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+Breast_data <- list(Genes = RNA,
+                    miRNA = miRNA,
+                    lncRNA = lncRNA,
+                    Protein = Protein)
+```
+Create and visualize MOFA object
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+MOFAobject <- create_mofa(Breast_data)
+```
+```{r}
+plot_data_overview(MOFAobject)
+```
+Select MOFA parameters for the model (30 factors are selected after trying different numbers as the best estimaed variance by each omic)
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+data_opts <- get_default_data_options(MOFAobject)
+model_opts <- get_default_model_options(MOFAobject)
+model_opts$num_factors <- 30
+train_opts <- get_default_training_options(MOFAobject)
+train_opts$convergence_mode <- "slow"
+train_opts$seed <- 42
+train_opts$maxiter <- 1000
+```
+
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+MOFAobject <- prepare_mofa(MOFAobject,
+                           data_options = data_opts,
+                           model_options = model_opts,
+                           training_options = train_opts
+)
+```
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+MOFAobject <- run_mofa(MOFAobject)
+```
+
+Add metadata to the MOFA Object
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+Total_pheno <- metadata[row.names(FilteredMetaData),]
+Total_pheno$sample <- Total_pheno$bcr_patient_barcode
+samples_metadata(MOFAobject) <- Total_pheno
+```
+Save the MOFA object
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+save(MOFAobject , file = "MOFA_BRCA.RDATA")
+```
+
+Plot Factor correlation
+```{r}
+plot_factor_cor(MOFAobject)
+```
+Non of the 30 factors are higly correlated to each other 
+
+
+Plot variance ration explaind by each factor accros the four omics
+```{r}
+plot_variance_explained(MOFAobject, max_r2=10)
+```
+Factors 1 and 3 explain the variance using the four omics with the highest ration for Genes and lncRNA. while factor 2 is specific for Genes and lncRNA features. Factors 4 and 5 only explains variance bwteen samples by using the Protein features. other factors explains lower ratios.
+```{r}
+Variance_Explained <-  MOFAobject@cache$variance_explained$r2_per_factor
+Variance_Explained <- as.data.frame(Variance_Explained)
+Variance_Explained
+
+```
+```{r}
+plot_factors(MOFAobject, 
+             factors = 1:3,
+             color_by = 'IMS'
+)
+```
+```{r}
+plot_variance_explained(MOFAobject, plot_total = T)[[2]]
+
+```
+As total variance explained, Genes and priteins explain the highest variance among the selected samples.
+
+```{r}
+plot_factor(MOFAobject, 
+            factors = c(1,2,3,4), 
+            color_by = "IMS"
+)
+```
+Factor 1 explains the variance between the Basal breast cancer subtype and the Luminal ones. while other factors cannot explaint the variance between the selected subtypes.
+
+```{r}
+plot_factor(MOFAobject, 
+            factors = c(5,6,7,8), 
+            color_by = "IMS"
+)
+```
+```{r}
+plot_data_heatmap(MOFAobject, 
+                  view = "miRNA",
+                  factor = 1,  
+                  features = 100,
+                  cluster_rows = TRUE, cluster_cols = TRUE,
+                  show_rownames = FALSE, show_colnames = FALSE,
+                  scale = "none"
+)
+
+```
+```{r}
+plot_data_heatmap(MOFAobject, 
+                  view = "Genes",
+                  factor = 1,  
+                  features = 50,
+                  cluster_rows = FALSE, cluster_cols = TRUE,
+                  show_rownames = TRUE, show_colnames = TRUE,
+                  scale = "none"
+)
+```
+```{r}
+plot_data_heatmap(MOFAobject, 
+                  view = "Protein",
+                  factor = 1,  
+                  features = 50,
+                  cluster_rows = FALSE, cluster_cols = TRUE,
+                  show_rownames = TRUE, show_colnames = TRUE,
+                  scale = "none"
+)
+```
+```{r}
+plot_data_heatmap(MOFAobject, 
+                  view = "lncRNA",
+                  factor = 1,  
+                  features = 50,
+                  cluster_rows = FALSE, cluster_cols = TRUE,
+                  show_rownames = TRUE, show_colnames = TRUE,
+                  scale = "none"
+)
+```
+```{r}
+Total_pheno <- as.data.frame(MOFAobject@samples_metadata)
+colnames(MOFAobject@samples_metadata)
+```
+```{r}
+library(rstatix)
+```
+Statistical Anova test shows that factor one also significantly correlated with the race of the samples which may affect the variance explained by factor 1 due to biological differences (Can be better visualized)
+```{r}
+Zmatrix <- as.data.frame(MOFAobject@expectations$Z)
+for(i in 1){
+  df <- data.frame(factor = as.numeric(Zmatrix[,i]) , obj = Total_pheno[,"race"])
+  Ttest <- df %>% anova_test(factor~obj)
+  print(Ttest)
+}
+```
+Anova Test shown significant correlation between race and samples values in Factor1
+```{r}
+Zmatrix <- as.data.frame(MOFAobject@expectations$Z)
+for(i in 1){
+  df <- data.frame(factor = as.numeric(Zmatrix[,i]) , obj = Total_pheno[,"IMS"])
+  Ttest <- df %>% anova_test(factor~obj)
+  print(Ttest)
+}
+```
+
+Anova Test shown significant correlation between breast cancer subtypes and samples values in Factor1
+
+```{r}
+MOFAobject@samples_metadata$age_diagnosis <-
+MOFAobject@samples_metadata$age_at_initial_pathologic_diagnosis
+correlate_factors_with_covariates(MOFAobject, 
+                                  covariates = c("age_diagnosis","birth_days_to","last_contact_days_to"), 
+                                  #plot="log_pval"
+                                  plot = "r"
+)
+
+```
+```{r}
+correlate_factors_with_covariates(MOFAobject, 
+                                  covariates = c("age_diagnosis","birth_days_to","last_contact_days_to" ), 
+                                  plot="log_pval"
+                                  #plot = "r"
+)
+```
+Factor1 samples are slightly correlated with days to birth and age at diagnosis
+```{r}
+p <- plot_factors(MOFAobject, 
+                  factors = c(1,3), 
+                  color_by = "IMS",
+                  dot_size = 2.5,
+                  show_missing = T
+)
+
+p <- p + 
+  #geom_hline(yintercept=0.1, linetype="dashed") +
+  geom_vline(xintercept=(-0.2), linetype="dashed")+
+  geom_vline(xintercept=(1.2), linetype="dashed")
+
+print(p)
+```
+Factor1 against Factor3 reveals that Factor1 can also explain variance between Basal and Her2 subtypes for future analysis
+
+#Genes Results
+```{r}
+plot_top_weights(MOFAobject,
+ view = "Genes",
+ factor = c(1),
+ nfeatures = 20,
+ sign = 'positive',# Top number of features to highlight
+ scale = T           # Scale weights from -1 to 1
+)
+
+```
+
+
+```{r}
+plot_top_weights(MOFAobject,
+ view = "Genes",
+ factor = c(1),
+ nfeatures = 20, 
+ sign = "negative",
+ scale = F           # Scale weights from -1 to 1
+)
+
+```
+
+#miRNA Results
+```{r}
+plot_top_weights(MOFAobject,
+ view = "miRNA",
+ factor = c(1),
+ nfeatures = 20,
+ sign = 'positive',# Top number of features to highlight
+ scale = T           # Scale weights from -1 to 1
+)
+
+```
+
+
+```{r}
+plot_top_weights(MOFAobject,
+ view = "miRNA",
+ factor = c(1),
+ nfeatures = 20, 
+ sign = "negative",
+ scale = T           # Scale weights from -1 to 1
+)
+
+```
+
+
+#Protein Results
+```{r}
+plot_top_weights(MOFAobject,
+ view = "Protein",
+ factor = c(1),
+ nfeatures = 20,
+ sign = 'positive',# Top number of features to highlight
+ scale = T           # Scale weights from -1 to 1
+)
+
+```
+
+
+```{r}
+plot_top_weights(MOFAobject,
+ view = "Protein",
+ factor = c(1),
+ nfeatures = 20, 
+ sign = "negative",
+ scale = T           # Scale weights from -1 to 1
+)
+
+```
+
+#Enrichment
+
+```{r message=FALSE, warning=FALSE}
+library(biomaRt)
+```
+
+```{r}
+RNA_Features <- features_names(MOFAobject)[["Genes"]]
+lncRNA_Features <- features_names(MOFAobject)[["lncRNA"]]
+miRNA_Features <- features_names(MOFAobject)[["miRNA"]]
+Protein_Features <- features_names(MOFAobject)[["Protein"]]
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+utils::data(reactomeGS)
+utils::data("MSigDB_v6.0_C2_human") 
+```
+#Genes - MOFA - Reactome
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+Gene_ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+attributes<- listAttributes (Gene_ensembl)
+Genes_ensembl_IDs <- getBM(attributes = c("ensembl_gene_id", "external_gene_name"), 
+                     filters = "external_gene_name", 
+                     values = RNA_Features, 
+                     mart = Gene_ensembl)
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+indexes <- match(colnames(reactomeGS) , Genes_ensembl_IDs$ensembl_gene_id)
+dim(reactomeGS)
+sum(!is.na(indexes))
+indexes <- !is.na(indexes)
+reactome <- reactomeGS[,indexes]
+indexes <- match(colnames(reactome) , Genes_ensembl_IDs$ensembl_gene_id)
+col_names = Genes_ensembl_IDs$external_gene_name[indexes]
+colnames(reactome) <- col_names
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+save(reactome , file = "reactomeDB.RDATA")
+```
+```{r}
+load("reactomeDB.RDATA")
+```
+
+
+
+#MOFA - Genes
+```{r message=FALSE, warning=FALSE}
+# GSEA on positive weights, with default options
+res.positive <- run_enrichment(MOFAobject, 
+  feature.sets = reactome,  
+  view = "Genes",
+  sign = "positive"
+)
+
+# GSEA on negative weights, with default options
+res.negative <- run_enrichment(MOFAobject, 
+  feature.sets = reactome, 
+  view = "Genes",
+  sign = "negative"
+)
+```
+```{r}
+plot_enrichment(res.positive, 
+  factor = 1, 
+  max.pathways = 15,
+  alpha = 0.25
+)
+```
+```{r}
+plot_enrichment(res.negative, 
+  factor = 1, 
+  max.pathways = 15,
+  alpha = 0.25
+)
+```
+
+#Final Excel Sheet
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+OUT <- createWorkbook()
+```
+
+#Genes - GSEA - Software
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+#Prpare the gene set 
+GSEA_input <- as.data.frame(MOFAobject@expectations$W$Genes[,'Factor1'])
+colnames(GSEA_input) <- 'Weights'
+#Rename the Genes to remove _Genes
+indexes<- which(grepl(pattern = "_Genes" , x = row.names(GSEA_input) ))
+Genes_toBeReplaced <- row.names(GSEA_input)[indexes]
+Genes_toBeReplaced <- gsub(pattern = "_Genes" , "" , Genes_toBeReplaced)
+row.names(GSEA_input)[indexes] <- Genes_toBeReplaced
+#Add Genes Column
+GSEA_input$Genes <- row.names(GSEA_input)
+GSEA_input <- GSEA_input[,c('Genes' , 'Weights')]
+GSEA_input <- GSEA_input %>% arrange(desc(Weights))
+write.table(GSEA_input , sep = "\t",file = 'GSEA_input.rnk' , quote = FALSE , row.names = FALSE)
+```
+
+
+Reactome
+```{r}
+GSEA_positive_Output_Reactome <- read.delim("Enrichment_Results/GSEA_Reactome.GseaPreranked.1679677635779/gsea_report_for_na_pos_1679677635779.tsv") %>% filter(NOM.p.val <= 0.05)%>% dplyr::arrange(NOM.p.val) %>% dplyr::select(NAME , NOM.p.val) 
+
+ggplot(GSEA_positive_Output_Reactome , aes(x = reorder(NAME , - NOM.p.val)  , y = -log(NOM.p.val + 0.5) , fill = -log(NOM.p.val + 0.5))) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme(axis.text  = element_text(size = 5)) +
+  xlab('Reactome Pathways')
+```
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+addWorksheet(OUT , 'GSEA_positive_Output_Reactome')
+writeData(OUT, sheet = "GSEA_positive_Output_Reactome", x = GSEA_positive_Output_Reactome)
+```
+Select Pathways
+```{r}
+df <- GSEA_positive_Output_Reactome
+colm <- "NAME"
+selected_pathways <- c("REACTOME_INTERFERON_GAMMA_SIGNALING" ,
+                       "REACTOME_KERATINIZATION",
+                       "REACTOME_ANTIGEN_PROCESSING_CROSS_PRESENTATION",
+                       "REACTOME_NEUTROPHIL_DEGRANULATION",
+                       "REACTOME_INFLUENZA_INFECTION",
+                       "REACTOME_CYTOKINE_SIGNALING_IN_IMMUNE_SYSTEM",
+                       "REACTOME_COLLAGEN_DEGRADATION",
+                       "REACTOME_DEGRADATION_OF_THE_EXTRACELLULAR_MATRIX",
+                       "REACTOME_CELL_CYCLE_MITOTIC",
+                       "REACTOME_SARS_COV_2_MODULATES_HOST_TRANSLATION_MACHINERY",
+                       "REACTOME_SARS_COV_1_MODULATES_HOST_TRANSLATION_MACHINERY",
+                       "REACTOME_DETOXIFICATION_OF_REACTIVE_OXYGEN_SPECIES",
+                       "REACTOME_SARS_COV_2_HOST_INTERACTIONS",
+                       "REACTOME_HOST_INTERACTIONS_OF_HIV_FACTORS")
+indexes <- match(selected_pathways , df[,'NAME'])
+GSEA_positive_Output_Reactome_Selected <- df[indexes,]
+
+ggplot(GSEA_positive_Output_Reactome_Selected , aes(x = reorder(NAME , - NOM.p.val)  , y = -log(NOM.p.val + 0.5) , fill = -log(NOM.p.val + 0.5))) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme(axis.text  = element_text(size = 5)) +
+  xlab('Reactome Pathways')
+```
+
+
+```{r}
+GSEA_negative_Output_Reactome <- read.delim("Enrichment_Results/GSEA_Reactome.GseaPreranked.1679677635779/gsea_report_for_na_neg_1679677635779.tsv") %>% filter(NOM.p.val <= 0.05) %>% dplyr::select(NAME , NOM.p.val)
+
+ggplot(GSEA_negative_Output_Reactome , aes(x = reorder(NAME , - NOM.p.val)  , y = -log(NOM.p.val + 0.5) , fill = -log(NOM.p.val + 0.5))) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme(axis.text  = element_text(size = 5)) +
+  xlab('Reactome Pathways')
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+addWorksheet(OUT , 'GSEA_negative_Output_Reactome')
+writeData(OUT, sheet = "GSEA_negative_Output_Reactome", x = GSEA_negative_Output_Reactome)
+```
+
+Select Pathways
+```{r}
+df <- GSEA_negative_Output_Reactome
+colm <- "NAME"
+selected_pathways <- c("REACTOME_SPHINGOLIPID_METABOLISM" ,
+                       "REACTOME_PI3K_AKT_SIGNALING_IN_CANCER",
+                       "REACTOME_METABOLISM_OF_LIPIDS",
+                       "REACTOME_NEGATIVE_REGULATION_OF_THE_PI3K_AKT_NETWORK")
+indexes <- match(selected_pathways , df[,'NAME'])
+GSEA_negative_Output_Reactome_Selected <- df[indexes,]
+
+ggplot(GSEA_negative_Output_Reactome_Selected , aes(x = reorder(NAME , - NOM.p.val)  , y = -log(NOM.p.val + 0.5) , fill = -log(NOM.p.val + 0.5))) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme(axis.text  = element_text(size = 5)) +
+  xlab('Reactome Pathways')
+```
+
+
+C5goBp
+```{r}
+GSEA_positive_Output_C5 <- read.delim("Enrichment_Results/GSEA_C5gobp.GseaPreranked.1679677560989/gsea_report_for_na_pos_1679677560989.tsv") %>% filter(NOM.p.val <= 0.05) %>% dplyr::select(NAME , NOM.p.val)
+
+ggplot(GSEA_positive_Output_C5 , aes(x = reorder(NAME , - NOM.p.val)  , y = -log(NOM.p.val + 0.5) , fill = -log(NOM.p.val + 0.5))) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme(axis.text  = element_text(size = 5)) +
+  xlab('GO Biological Processes')
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+addWorksheet(OUT , 'GSEA_positive_Output_C5')
+writeData(OUT, sheet = "GSEA_positive_Output_C5", x = GSEA_positive_Output_C5)
+```
+Select Biological Processes
+```{r}
+df <- GSEA_positive_Output_C5
+colm <- "NAME"
+selected_BP <- c("GOBP_ANTIMICROBIAL_HUMORAL_RESPONSE" ,
+                 "GOBP_CELLULAR_RESPONSE_TO_TYPE_II_INTERFERON",
+                 "GOBP_POSITIVE_REGULATION_OF_MONONUCLEAR_CELL_MIGRATION",
+                 "GOBP_HUMORAL_IMMUNE_RESPONSE",
+                 "GOBP_REGULATION_OF_SUBSTRATE_ADHESION_DEPENDENT_CELL_SPREADING",
+                 "GOBP_CYTOKINE_PRODUCTION",
+                 "GOBP_DEFENSE_RESPONSE_TO_OTHER_ORGANISM",
+                 "GOBP_INNATE_IMMUNE_RESPONSE",
+                 "GOBP_RESPONSE_TO_MOLECULE_OF_BACTERIAL_ORIGIN",
+                 "GOBP_INFLAMMATORY_RESPONSE",
+                 "GOBP_POSITIVE_REGULATION_OF_IMMUNE_SYSTEM_PROCESS",
+                 "GOBP_CELL_ADHESION",
+                 "GOBP_ANTIMICROBIAL_HUMORAL_IMMUNE_RESPONSE_MEDIATED_BY_ANTIMICROBIAL_PEPTIDE",
+                 "GOBP_COLLAGEN_METABOLIC_PROCESS",
+                 "GOBP_TUMOR_NECROSIS_FACTOR_SUPERFAMILY_CYTOKINE_PRODUCTION",
+                 "GOBP_POSITIVE_REGULATION_OF_CYTOKINE_PRODUCTION",
+                 "GOBP_DEFENSE_RESPONSE_TO_GRAM_POSITIVE_BACTERIUM",
+                 "GOBP_EXTRACELLULAR_MATRIX_DISASSEMBLY",
+                 "GOBP_DNA_REPAIR")
+indexes <- match(selected_BP , df[,colm])
+GSEA_positive_Output_C5_Selected <- df[indexes,]
+
+ggplot(GSEA_positive_Output_C5_Selected , aes(x = reorder(NAME , - NOM.p.val)  , y = -log(NOM.p.val + 0.5) , fill = -log(NOM.p.val + 0.5))) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme(axis.text  = element_text(size = 5)) +
+  xlab('Reactome Pathways')
+```
+
+```{r}
+GSEA_negative_Output_C5 <- read.delim("Enrichment_Results/GSEA_C5gobp.GseaPreranked.1679677560989/gsea_report_for_na_neg_1679677560989.tsv") %>% filter(NOM.p.val <= 0.05) %>% dplyr::select(NAME , NOM.p.val)
+
+ggplot(GSEA_negative_Output_C5 , aes(x = reorder(NAME , - NOM.p.val)  , y = -log(NOM.p.val + 0.5) , fill = -log(NOM.p.val + 0.5))) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme(axis.text  = element_text(size = 4)) +
+  xlab('GO Biological Processes')
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+addWorksheet(OUT , 'GSEA_negative_Output_C5')
+writeData(OUT, sheet = "GSEA_negative_Output_C5", x = GSEA_negative_Output_C5)
+```
+Select Biological Processes
+```{r}
+df <- GSEA_negative_Output_C5
+colm <- "NAME"
+selected_BP <- c("GOBP_MEMBRANE_LIPID_BIOSYNTHETIC_PROCESS" ,
+                 "GOBP_MAMMARY_GLAND_EPITHELIUM_DEVELOPMENT",
+                 "GOBP_SPHINGOLIPID_BIOSYNTHETIC_PROCESS",
+                 "GOBP_LIPID_MODIFICATION",
+                 "GOBP_MEMBRANE_LIPID_METABOLIC_PROCESS",
+                 "GOBP_STEROID_BIOSYNTHETIC_PROCESS",
+                 "GOBP_SPHINGOLIPID_METABOLIC_PROCESS",
+                 "GOBP_LIPID_METABOLIC_PROCESS",
+                 "GOBP_LIPID_OXIDATION",
+                 "GOBP_STEROID_METABOLIC_PROCESS",
+                 "GOBP_LIPID_BIOSYNTHETIC_PROCESS",
+                 "GOBP_REGULATION_OF_NEUROTRANSMITTER_LEVELS",
+                 "GOBP_CELLULAR_LIPID_METABOLIC_PROCESS",
+                 "GOBP_GLANDULAR_EPITHELIAL_CELL_DIFFERENTIATION",
+                 "GOBP_FATTY_ACID_METABOLIC_PROCESS",
+                 "GOBP_NEGATIVE_REGULATION_OF_TRANSMEMBRANE_TRANSPORT",
+                 "GOBP_HORMONE_TRANSPORT",
+                 "GOBP_REGULATION_OF_LIPID_METABOLIC_PROCESS")
+indexes <- match(selected_BP , df[,colm])
+GSEA_negative_Output_C5_Selected <- df[indexes,]
+
+ggplot(GSEA_negative_Output_C5_Selected , aes(x = reorder(NAME , - NOM.p.val)  , y = -log(NOM.p.val + 0.5) , fill = -log(NOM.p.val + 0.5))) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme(axis.text  = element_text(size = 7)) +
+  xlab('Reactome Pathways')
+```
+#Proteins - GSEA - Software
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+#Prpare the gene set 
+Protein_input <- as.data.frame(MOFAobject@expectations$W$Protein[,'Factor1'])
+colnames(Protein_input) <- 'Weights'
+#Rename the Genes to remove _Genes
+indexes<- which(grepl(pattern = "_Protein" , x = row.names(Protein_input) ))
+Protein_toBeReplaced <- row.names(Protein_input)[indexes]
+Protein_toBeReplaced <- gsub(pattern = "_Protein" , "" , Protein_toBeReplaced)
+row.names(Protein_input)[indexes] <- Protein_toBeReplaced
+#Add Genes Column
+Protein_input$Proteins <-row.names(Protein_input)
+Protein_input <- Protein_input[,c('Proteins' , 'Weights')]
+Protein_input <- Protein_input %>% arrange(desc(Weights))
+write.table(Protein_input , sep = "\t",file = 'Protein_input.rnk' , quote = FALSE , row.names = FALSE)
+```
+Reactome
+```{r}
+Protein_positive_Output_Reactome <- read.delim("Enrichment_Results/Protein_Reactome.GseaPreranked.1679677623172/gsea_report_for_na_pos_1679677623172.tsv") %>% filter(NOM.p.val <= 0.05) %>% dplyr::select(NAME , NOM.p.val)
+
+ggplot(Protein_positive_Output_Reactome , aes(x = reorder(NAME , - NOM.p.val)  , y = -log(NOM.p.val + 0.5) , fill = -log(NOM.p.val + 0.5))) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme(axis.text  = element_text(size = 5)) +
+  xlab('Reactome Pathways')
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+addWorksheet(OUT , 'Protein_pos_Reactome')
+writeData(OUT, sheet = "Protein_pos_Reactome", x = Protein_positive_Output_Reactome)
+```
+Select Pathways
+```{r}
+df <- Protein_positive_Output_Reactome
+colm <- "NAME"
+selected_pathways <- c("REACTOME_CELL_CYCLE_MITOTIC",
+                       "REACTOME_CELL_CYCLE",
+                       "REACTOME_CELL_CYCLE_CHECKPOINTS",
+                       "REACTOME_MITOTIC_G1_PHASE_AND_G1_S_TRANSITION")
+indexes <- match(selected_pathways , df[,'NAME'])
+Protein_positive_Output_Reactome_Selected <- df[indexes,]
+
+ggplot(Protein_positive_Output_Reactome_Selected , aes(x = reorder(NAME , - NOM.p.val)  , y = -log(NOM.p.val + 0.5) , fill = -log(NOM.p.val + 0.5))) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme(axis.text  = element_text(size = 5)) +
+  xlab('Reactome Pathways')
+```
+
+```{r}
+Protein_negative_Output_Reactome <- read.delim("Enrichment_Results/Protein_Reactome.GseaPreranked.1679677623172/gsea_report_for_na_neg_1679677623172.tsv") %>% filter(NOM.p.val <= 0.05) %>% dplyr::select(NAME , NOM.p.val) 
+
+ggplot(Protein_negative_Output_Reactome , aes(x = reorder(NAME , - NOM.p.val)  , y = -log(NOM.p.val + 0.5) , fill = -log(NOM.p.val + 0.5))) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme(axis.text  = element_text(size = 8)) +
+  xlab('Reactome Pathways')
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+addWorksheet(OUT , 'Protein_neg_Reactome')
+writeData(OUT, sheet = "Protein_neg_Reactome", x = Protein_negative_Output_Reactome)
+```
+Select Pathways
+```{r}
+df <- Protein_negative_Output_Reactome
+colm <- "NAME"
+selected_pathways <- c("REACTOME_SIGNALING_BY_INSULIN_RECEPTOR",
+                       "REACTOME_INSULIN_RECEPTOR_SIGNALLING_CASCADE")
+indexes <- match(selected_pathways , df[,'NAME'])
+Protein_negative_Output_Reactome_Selected <- df[indexes,]
+
+ggplot(Protein_negative_Output_Reactome_Selected , aes(x = reorder(NAME , - NOM.p.val)  , y = -log(NOM.p.val + 0.5) , fill = -log(NOM.p.val + 0.5))) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme(axis.text  = element_text(size = 7)) +
+  xlab('Reactome Pathways')
+```
+
+C5goBp
+```{r}
+Protein_positive_Output_C5 <- read.delim("Enrichment_Results/Protein_C5gobp.GseaPreranked.1679677577693/gsea_report_for_na_pos_1679677577693.tsv") %>% filter(NOM.p.val <= 0.05) %>% dplyr::select(NAME , NOM.p.val)
+
+ggplot(Protein_positive_Output_C5 , aes(x = reorder(NAME , - NOM.p.val)  , y = -log(NOM.p.val + 0.5) , fill = -log(NOM.p.val + 0.5))) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme(axis.text  = element_text(size = 8)) +
+  xlab('GO Biological Processes')
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+addWorksheet(OUT , 'Protein_pos_C5')
+writeData(OUT, sheet = "Protein_pos_C5", x = Protein_positive_Output_C5)
+```
+Select Biological Processes
+```{r}
+df <- Protein_positive_Output_C5
+colm <- "NAME"
+selected_BP <- c('GOBP_MITOTIC_CELL_CYCLE_PROCESS',
+                 'GOBP_RESPONSE_TO_BACTERIUM',
+                 'GOBP_RESPONSE_TO_CYTOKINE',
+                 'GOBP_PHAGOCYTOSIS',
+                 'GOBP_MITOTIC_CELL_CYCLE_CHECKPOINT_SIGNALING',
+                 'GOBP_RESPONSE_TO_MOLECULE_OF_BACTERIAL_ORIGIN',
+                 'GOBP_LYMPHOCYTE_APOPTOTIC_PROCESS',
+                 'GOBP_REGULATION_OF_CELL_CELL_ADHESION',
+                 'GOBP_B_CELL_ACTIVATION',
+                 'GOBP_CYTOKINE_MEDIATED_SIGNALING_PATHWAY',
+                 'GOBP_T_CELL_PROLIFERATION',
+                 'GOBP_NEGATIVE_REGULATION_OF_PROTEIN_SERINE_THREONINE_KINASE_ACTIVITY',
+                 'GOBP_REGULATION_OF_CELL_CYCLE_G2_M_PHASE_TRANSITION',
+                 'GOBP_CELL_CELL_ADHESION',
+                 'GOBP_POSITIVE_REGULATION_OF_I_KAPPAB_KINASE_NF_KAPPAB_SIGNALING')
+indexes <- match(selected_BP , df[,colm])
+Protein_positive_Output_C5_Selected <- df[indexes,]
+
+ggplot(Protein_positive_Output_C5_Selected , aes(x = reorder(NAME , - NOM.p.val)  , y = -log(NOM.p.val + 0.5) , fill = -log(NOM.p.val + 0.5))) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme(axis.text  = element_text(size = 7)) +
+  xlab('Reactome Pathways')
+```
+
+```{r}
+Protein_negative_Output_C5 <- read.delim("Enrichment_Results/Protein_C5gobp.GseaPreranked.1679677577693/gsea_report_for_na_neg_1679677577693.tsv") %>% filter(NOM.p.val <= 0.05) %>% dplyr::select(NAME , NOM.p.val)
+
+ggplot(Protein_negative_Output_C5 , aes(x = reorder(NAME , - NOM.p.val)  , y = -log(NOM.p.val + 0.5) , fill = -log(NOM.p.val + 0.5))) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme(axis.text  = element_text(size = 6)) +
+  xlab('GO Biological Processes')
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+addWorksheet(OUT , 'Protein_neg_C5')
+writeData(OUT, sheet = "Protein_neg_C5", x = Protein_negative_Output_C5)
+```
+Select Biological Processes
+```{r}
+df <- Protein_negative_Output_C5
+colm <- "NAME"
+selected_BP <- c('GOBP_INSULIN_LIKE_GROWTH_FACTOR_RECEPTOR_SIGNALING_PATHWAY',
+                 'GOBP_MAMMARY_GLAND_DEVELOPMENT',
+                 'GOBP_MAMMARY_GLAND_EPITHELIUM_DEVELOPMENT',
+                 'GOBP_RESPONSE_TO_STEROID_HORMONE',
+                 'GOBP_LIPID_BIOSYNTHETIC_PROCESS',
+                 'GOBP_CELLULAR_RESPONSE_TO_INSULIN_STIMULUS',
+                 'GOBP_LIPID_METABOLIC_PROCESS',
+                 'GOBP_INOSITOL_LIPID_MEDIATED_SIGNALING')
+indexes <- match(selected_BP , df[,colm])
+Protein_negative_Output_C5_Selected <- df[indexes,]
+
+ggplot(Protein_negative_Output_C5_Selected , aes(x = reorder(NAME , - NOM.p.val)  , y = -log(NOM.p.val + 0.5) , fill = -log(NOM.p.val + 0.5))) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme(axis.text  = element_text(size = 7)) +
+  xlab('Reactome Pathways')
+```
+
+#miRNA Overrepresentation
+Grouping by MOFA factor
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+cluster_f1<- cluster_samples(object = MOFAobject, factors = 1, k = 2)
+cluster_f1_a<- as.data.frame (cluster_f1[["cluster"]])
+colnames(cluster_f1_a)<- "group"
+ Z_data<- get_expectations(MOFAobject, variable = "Z")
+
+# rename groups
+cluster_f1_a$groups <- ifelse(cluster_f1_a$group==  1, "Negative", "Positive")
+```
+
+Expression matrix
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+mi_indx<- match (rownames(cluster_f1_a), colnames(miRNA.data))
+mi_mtrx<- miRNA.data[miRNA_Features, mi_indx]
+```
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+cond1="Negative" 
+cond2="Positive"
+# perform deseq analysis
+dds = DESeqDataSetFromMatrix( countData = mi_mtrx, colData = cluster_f1_a , design = ~ groups )
+dds.run = DESeq(dds)
+
+res=results(dds.run, contrast = c("groups" ,cond2, cond1) )
+# remove nulls
+res=res[complete.cases(res), ]
+summary(res)
+mi_res.df=as.data.frame(res)
+```
+
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+write.table(mi_res.df, file = "res_mi_RNA.txt")
+```
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+ ## 3. Selection for DEMS
+dems.res_up =mi_res.df[mi_res.df$padj< 0.05 & mi_res.df$log2FoldChange > 0.5,]
+dim(dems.res_up)
+dems.up=dems.res_up[order(dems.res_up$padj), ]
+dems_up.=rownames(dems.up)
+```
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+dems.res_dwn =mi_res.df[mi_res.df$padj< 0.05 & mi_res.df$log2FoldChange < -0.5,]
+dim(dems.res_dwn)
+dems.dwn=dems.res_dwn[order(dems.res_dwn$padj), ]
+dems.d=rownames(dems.res_dwn)
+```
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+#  export them to a miRNA list to start the miRNA over representation analysis.
+save( dems_up., dems.d , mi_res.df, file= "mi_res_dems.RDATA")
+write.table(dems_up., file = "mi_dems_up.txt", quote = FALSE , row.names = FALSE, col.names =  FALSE)
+write.table(dems.d, file = "mi_dems_dwn.txt", quote = FALSE , row.names = FALSE, col.names =  FALSE)
+```
+
+TAM2-UP - Visualization
+```{r}
+TAM2_OUTPUT_UP <- read.delim("miRNA_UP_TAM2.txt")
+table(TAM2_OUTPUT_UP$Category)
+```
+```{r}
+TAM2_OUTPUT_UP_Function <- TAM2_OUTPUT_UP %>% filter(Category == 'Function') %>% dplyr::select(Term , FDR) %>% arrange(FDR)%>% filter(FDR < 0.05)
+
+ggplot(TAM2_OUTPUT_UP_Function , aes(x = reorder(Term , -FDR)  , y = -log(FDR)  , fill = -log(FDR))) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme(axis.text  = element_text(size = 8))
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+addWorksheet(OUT , 'TAM2_OUTPUT_UP_Function')
+writeData(OUT, sheet = "TAM2_OUTPUT_UP_Function", x = TAM2_OUTPUT_UP_Function)
+```
+Select Functions
+```{r}
+df <- TAM2_OUTPUT_UP_Function
+colm <- "Term"
+selected_Fn <- c("Immune Response",
+                 "Inflammation",
+                 "Immune System(Xiao's Cell2010)",
+                 "Cell Proliferation",
+                 "Cell Cycle",
+                 "Regulation of Akt Pathway",
+                 "Response to Hypoxia",
+                 "T-Cell Activation",
+                 "Neutrophil Differentiation")
+indexes <- match(selected_Fn , df[,colm])
+TAM2_OUTPUT_UP_Function_Selected <- df[indexes,]
+
+ggplot(TAM2_OUTPUT_UP_Function_Selected , aes(x = reorder(Term , -FDR)  , y = -log(FDR)  , fill = -log(FDR))) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme(axis.text  = element_text(size = 8))
+```
+
+TAM2-DOWN - Visualization
+```{r}
+TAM2_OUTPUT_DOWN <- read.delim("miRNA_DOWN_TAM2.txt")
+table(TAM2_OUTPUT_DOWN$Category)
+```
+```{r}
+TAM2_OUTPUT_DOWN_Function <- TAM2_OUTPUT_DOWN %>% filter(Category == 'Function') %>% dplyr::select(Term , FDR) %>% arrange(FDR)%>% filter(FDR < 0.05)
+
+ggplot(TAM2_OUTPUT_DOWN_Function , aes(x = reorder(Term , -FDR)  , y = -log(FDR)  , fill = -log(FDR))) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme(axis.text  = element_text(size = 8))
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+addWorksheet(OUT , 'TAM2_OUTPUT_DOWN_Function')
+writeData(OUT, sheet = "TAM2_OUTPUT_DOWN_Function", x = TAM2_OUTPUT_DOWN_Function)
+```
+Select Functions
+```{r}
+df <- TAM2_OUTPUT_DOWN_Function
+colm <- "Term"
+selected_Fn <- c("Cell Cycle",
+                 "Cell Differentiation",
+                 "Epithelial-to-Mesenchymal Transition",
+                 "Adipocyte Differentiation",
+                 "Lipid Metabolism",
+                 "Cell Proliferation",
+                 "T-Cell Differentiation",
+                 "Extracellular Matrix Remodeling",
+                 "Inflammation",
+                 "Hormone-mediated Signaling Pathway ")
+indexes <- match(selected_Fn , df[,colm])
+TAM2_OUTPUT_DOWN_Function_Selected <- df[indexes,]
+
+ggplot(TAM2_OUTPUT_DOWN_Function_Selected , aes(x = reorder(Term , -FDR)  , y = -log(FDR)  , fill = -log(FDR))) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme(axis.text  = element_text(size = 8))
+```
+
+#lncRNA Overrepresentation
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+#Prpare the gene set 
+lnc_input <- as.data.frame(MOFAobject@expectations$W$lncRNA[,'Factor1'])
+colnames(lnc_input) <- 'Weights'
+lnc_input <- lnc_input %>% arrange(desc(Weights))
+lnc_input$probe_ID <- row.names(lnc_input)
+lnc_input <- lnc_input[,c('probe_ID','Weights')]
+write.table(lnc_input , file = "lnc_arranged.tsv" , quote = FALSE , row.names = FALSE , col.names = TRUE)
+```
+
+expression matrix
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+ln_indx<- match (rownames(cluster_f1_a), colnames(lncRNA.data))
+lnc_mtrx<- lncRNA.data[lncRNA_Features, ln_indx]
+lnc_mtrx <- lnc_mtrx[complete.cases(lnc_mtrx),]
+```
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+cond1="Negative" 
+cond2="Positive"
+# perform deseq analysis
+dds = DESeqDataSetFromMatrix( countData = lnc_mtrx, colData = cluster_f1_a , design = ~ groups )
+dds.run = DESeq(dds)
+
+res=results(dds.run, contrast = c("groups",cond2 ,cond1) )
+# remove nulls
+res=res[complete.cases(res), ]
+summary(res)
+res.df=as.data.frame(res)
+```
+
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+write.table(res.df, file = "res_lncRNA.txt")
+```
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+ ## 3. Selection for DEMS
+
+lnc.res_up =res.df[res.df$padj< 0.05 & res.df$log2FoldChange > 1,]
+dim(lnc.res_up)
+lnc.up=lnc.res_up[order(lnc.res_up$padj), ]
+lnc_up.=rownames(lnc.up)
+```
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+lnc.res_dwn =res.df[res.df$padj< 0.05 & res.df$log2FoldChange < -1,]
+dim(lnc.res_dwn)
+lnc.dwn=lnc.res_dwn[order(lnc.res_dwn$padj), ]
+lnc.d=rownames(lnc.res_dwn)
+```
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+#  export them to a miRNA list to start the miRNA over representation analysis.
+save( lnc_up., lnc.d,res.df, file= "res_lnc.RDATA")
+write.table(lnc_up., file = "lnc_up.txt", quote = FALSE , row.names = FALSE, col.names =  FALSE)
+write.table(lnc.d, file = "lnc.d.txt", quote = FALSE , row.names = FALSE, col.names =  FALSE)
+```
+lnc_Enrichment Visualization
+
+Panther - Reactome -  UP
+```{r}
+Panther_Reactome_UP <- read_delim("Enrichment_Results/lnc_Enrichment/lncRNA_UP_erich/panter_lnc_reacto_up.txt", 
+    delim = "\t", escape_double = FALSE, 
+    trim_ws = TRUE, skip = 11)
+
+colnames(Panther_Reactome_UP)[c(7 , 8)] <- c('P.val' , 'FDR')
+Panther_Reactome_UP <- Panther_Reactome_UP %>% dplyr::select(`Reactome pathways` , P.val) %>% arrange(P.val)%>% filter(P.val < 0.05)
+
+ggplot(Panther_Reactome_UP , aes(x = reorder(`Reactome pathways` , -P.val)  , y = -log(P.val)  , fill = -log(P.val))) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme(axis.text  = element_text(size = 8))
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+addWorksheet(OUT , 'Panther_Reactome_UP')
+writeData(OUT, sheet = "Panther_Reactome_UP", x = Panther_Reactome_UP)
+```
+Select Reactome Pathways
+```{r}
+df <- Panther_Reactome_UP
+selected_Fn <- c("Nucleosome assembly (R-HSA-774815)",
+                 "Deposition of new CENPA-containing nucleosomes at the centromere (R-HSA-606279)",
+                 "Packaging Of Telomere Ends (R-HSA-171306)",
+                 "DNA methylation (R-HSA-5334118)",
+                 "Depurination (R-HSA-73927)",
+                 "Activated PKN1 stimulates transcription of AR (androgen receptor) regulated genes KLK2 and KLK3 (R-HSA-5625886)",
+                 "Cleavage of the damaged purine (R-HSA-110331)",
+                 "Recognition and association of DNA glycosylase with site containing an affected purine (R-HSA-110330)",
+                 "SIRT1 negatively regulates rRNA expression (R-HSA-427359)",
+                 "Assembly of the ORC complex at the origin of replication (R-HSA-68616)",
+                 "Activation of HOX genes during differentiation (R-HSA-5619507)")
+indexes <- match(selected_Fn , df$`Reactome pathways`)
+Panther_Reactome_UP_Selected <- df[indexes,]
+
+ggplot(Panther_Reactome_UP_Selected , aes(x = reorder(`Reactome pathways` , -P.val)  , y = -log(P.val)  , fill = -log(P.val))) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme(axis.text  = element_text(size = 5))
+```
+
+Panther - Reactome -  DOWN
+```{r}
+Panther_Reactome_DOWN <- read_delim("Enrichment_Results/lnc_Enrichment/lncRNA_DOWN_enrich/panther_lnc_dwn_reactome.txt", 
+    delim = "\t", escape_double = FALSE, 
+    trim_ws = TRUE, skip = 11)
+
+colnames(Panther_Reactome_DOWN)[c(7 , 8)] <- c('P.val' , 'FDR')
+Panther_Reactome_DOWN <- Panther_Reactome_DOWN %>% dplyr::select(`Reactome pathways` , P.val) %>% arrange(P.val)%>% filter(P.val < 0.05)
+
+ggplot(Panther_Reactome_DOWN , aes(x = reorder(`Reactome pathways` , -P.val)  , y = -log(P.val)  , fill = -log(P.val))) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme(axis.text  = element_text(size = 8))
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+addWorksheet(OUT , 'Panther_Reactome_DOWN')
+writeData(OUT, sheet = "Panther_Reactome_DOWN", x = Panther_Reactome_DOWN)
+```
+Select Reactome Pathways
+```{r}
+df <- Panther_Reactome_DOWN
+selected_Fn <- c("Insulin processing (R-HSA-264876)",
+                 "Deubiquitination (R-HSA-5688426)",
+                 "RUNX1 regulates transcription of genes involved in WNT signaling (R-HSA-8939256)",
+                 "Defective HK1 causes hexokinase deficiency (HK deficiency) (R-HSA-5619056)",
+                 "Degradation of the extracellular matrix (R-HSA-1474228)",
+                 "Transcriptional Regulation by MECP2 (R-HSA-8986944)",
+                 "Insulin processing (R-HSA-264876)",
+                 "Interferon alpha/beta signaling (R-HSA-909733)")
+indexes <- match(selected_Fn , df$`Reactome pathways`)
+Panther_Reactome_DOWN_Selected <- df[indexes,]
+
+ggplot(Panther_Reactome_DOWN_Selected , aes(x = reorder(`Reactome pathways` , -P.val)  , y = -log(P.val)  , fill = -log(P.val))) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme(axis.text  = element_text(size = 8))
+```
+
+mammary gland epithelial cell proliferation (GO:0033598)
+hormone metabolic process (GO:0042445)
+Panther - BP -  UP
+```{r}
+Panther_BP_UP <- read_delim("Enrichment_Results/lnc_Enrichment/lncRNA_UP_erich/panther_lncRNA_bp_up.txt", 
+    delim = "\t", escape_double = FALSE, 
+    trim_ws = TRUE, skip = 11)
+
+colnames(Panther_BP_UP)[c(7 , 8)] <- c('P.val' , 'FDR')
+Panther_BP_UP <- Panther_BP_UP %>% dplyr::select(`GO biological process complete` , P.val) %>% arrange(P.val)%>% filter(P.val < 0.01)
+
+ggplot(Panther_BP_UP , aes(x = reorder(`GO biological process complete` , -P.val)  , y = -log(P.val)  , fill = -log(P.val))) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme(axis.text  = element_text(size = 8))
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+addWorksheet(OUT , 'Panther_BP_UP')
+writeData(OUT, sheet = "Panther_BP_UP", x = Panther_BP_UP)
+```
+Panther - BP -  DOWN
+```{r}
+Panther_BP_DOWN <- read_delim("Enrichment_Results/lnc_Enrichment/lncRNA_DOWN_enrich/panther_lnc_dwn_GObp.txt", 
+    delim = "\t", escape_double = FALSE, 
+    trim_ws = TRUE, skip = 11)
+
+colnames(Panther_BP_DOWN)[c(7 , 8)] <- c('P.val' , 'FDR')
+Panther_BP_DOWN <- Panther_BP_DOWN %>% dplyr::select(`GO biological process complete` , P.val) %>% arrange(P.val)%>% filter(P.val < 0.01)
+
+ggplot(Panther_BP_DOWN , aes(x = reorder(`GO biological process complete` , -P.val)  , y = -log(P.val)  , fill = -log(P.val))) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme(axis.text  = element_text(size = 8))
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+addWorksheet(OUT , 'Panther_BP_DOWN')
+writeData(OUT, sheet = "Panther_BP_DOWN", x = Panther_BP_DOWN)
+```
+Topfun - Enrich - up
+
+```{r}
+topfun_enrich_UP <- read.delim('Enrichment_Results/lnc_Enrichment/lncRNA_UP_erich/toppfun_lnc_up_enrich.txt')
+table(topfun_enrich_UP$Category)
+```
+```{r}
+topfun_enrich_UP_BP <- topfun_enrich_UP %>% filter(Category == "GO: Biological Process") %>% dplyr::select(Name , p.value)
+
+ggplot(topfun_enrich_UP_BP , aes(x = reorder(`Name` , -p.value)  , y = -log(p.value)  , fill = -log(p.value))) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme(axis.text  = element_text(size = 8))
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+addWorksheet(OUT , 'topfun_enrich_UP_BP')
+writeData(OUT, sheet = "topfun_enrich_UP_BP", x = topfun_enrich_UP_BP)
+```
+Topfun - Enrich - DOWN
+
+```{r}
+topfun_enrich_DOWN <- read.delim('Enrichment_Results/lnc_Enrichment/lncRNA_DOWN_enrich/topfun_lnc_dwn.txt')
+table(topfun_enrich_DOWN$Category)
+```
+```{r}
+topfun_enrich_DOWN_BP <- topfun_enrich_DOWN %>% filter(Category == "GO: Biological Process") %>% dplyr::select(Name , p.value)
+
+ggplot(topfun_enrich_DOWN_BP , aes(x = reorder(`Name` , -p.value)  , y = -log(p.value)  , fill = -log(p.value))) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme(axis.text  = element_text(size = 8))
+```
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+addWorksheet(OUT , 'topfun_enrich_DOWN_BP')
+writeData(OUT, sheet = "topfun_enrich_DOWN_BP", x = topfun_enrich_DOWN_BP)
+```
+
+
+#Save Final Results
+```{r eval=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+saveWorkbook(OUT, "Enrichment_Results/Final_Tables/Final_Enrichment.xlsx")
+```
+
+```{r}
+library(survival)
+library(survminer)
+```
+
+```{r}
+Total_pheno$OS.time <- as.numeric(Total_pheno$OS.time)
+Total_pheno$deceased = Total_pheno$vital_status == "Dead"
+Total_pheno$Factor1 <-ifelse(Zmatrix$group1.Factor1 > 0 , "Pos" , "Neg")
+fit =survival::survfit(survival::Surv(OS.time,deceased ) ~ Factor1 , data = Total_pheno)
+ 
+```
+```{r message=FALSE, warning=FALSE}
+survminer::ggsurvplot(fit, data=Total_pheno,
+                                          pval=T,
+                                          risk.table=T,
+                                          risk.table.col="strata",
+                                          title = stringr::str_glue('Level'),
+                                          legend.title = "no. of Samples",
+                                          xlab = "Time by Days"
+                                          )
+```
+#Discussion
+The best MOFA factor was factor (1), which has the most variance contribution from each omic, followed by factor (3). There is no correlation detected between the generated factors. Factor (1) clearly differentiated between breast cancer subtypes. The basal was positive to factor one, while the luminal was negative.
+
+#a. Features positive to factor one
+The resulted enriched pathways from the four omics were mainly related to four main terms:
+
+(In this section we are representing examples of commonly enriched pathways, biological processes or Functions related to each module by exploring the highly enriched features)
+
+#1. Immune modulation.
+#mRNA
+#First Pathway: REACTOME_INTERFERON_GAMMA_SIGNALING
+```{r}
+knitr::include_graphics("Enrichment_Results/GSEA_Reactome.GseaPreranked.1679677635779/enplot_REACTOME_INTERFERON_GAMMA_SIGNALING_241.png")
+```
+
+```{r}
+plot_data_scatter(MOFAobject, 
+  view = "Genes",
+  factor = 1,  
+  features = c('GBP1', 'TRIM29', "GBP5" , 'VCAM1', 'HLA-E', 'HLA-A','SOCS3'),
+  sign = "positive",
+  color_by = "IMS"
+) + labs(y="mRNA expression")
+```
+
+```{r}
+plot_factor(MOFAobject, 
+            factors = c(1), 
+            color_by = "GBP1",
+            add_violin = T,
+            group_by = "IMS",
+            show_missing = T,
+            add_boxplot = T,
+            scale = T,
+            dot_size = 3,
+            dodge = T,
+            stroke = 0.1
+)
+```
+
+```{r}
+plot_weights(MOFAobject,
+ view = "Genes",
+ factor = c(1),
+ nfeatures = 1,
+ manual = c('GBP1', 'TRIM29', "GBP5" , 'VCAM1', 'HLA-E', 'HLA-A','SOCS3') ,
+ scale = F           # Scale weights from -1 to 1
+)
+```
+#Second Pathway: REACTOME_CYTOKINE_SIGNALING_IN_IMMUNE_SYSTEM
+```{r}
+knitr::include_graphics("Enrichment_Results/GSEA_Reactome.GseaPreranked.1679677635779/enplot_REACTOME_CYTOKINE_SIGNALING_IN_IMMUNE_SYSTEM_273.png")
+```
+
+```{r}
+plot_data_scatter(MOFAobject, 
+  view = "Genes",
+  factor = 1,  
+  features = c('FSCN1','SOD2_Genes', 'MSN', 'ANXA1_Genes','PSME4', 'TRIM29', 'FLNA', 'VIM'),
+  sign = "positive",
+  color_by = "IMS"
+) + labs(y="mRNA expression")
+```
+```{r}
+plot_factor(MOFAobject, 
+            factors = c(1), 
+            color_by = "FSCN1",
+            add_violin = T,
+            group_by = "IMS",
+            show_missing = T,
+            add_boxplot = T,
+            scale = T,
+            dot_size = 3,
+            dodge = T,
+            stroke = 0.1
+)
+```
+
+```{r}
+plot_weights(MOFAobject,
+ view = "Genes",
+ factor = c(1),
+ nfeatures = 1,
+ manual = c('FSCN1','SOD2_Genes', 'MSN', 'ANXA1_Genes','PSME4', 'TRIM29', 'FLNA', 'VIM') ,
+ scale = F           # Scale weights from -1 to 1
+)
+```
+#First Biological Process: GOBP_CELLULAR_RESPONSE_TO_TYPE_II_INTERFERON
+```{r}
+knitr::include_graphics("Enrichment_Results/GSEA_C5gobp.GseaPreranked.1679677560989/enplot_GOBP_CELLULAR_RESPONSE_TO_TYPE_II_INTERFERON_99.png")
+```
+```{r}
+plot_data_scatter(MOFAobject, 
+  view = "Genes",
+  factor = 1,  
+  features = c('GBP1', 'ACTR3', "CX3CL1" , 'VIM', 'SYNCRIP', 'ASS1','GAPDH_Genes'),
+  sign = "positive",
+  color_by = "IMS"
+) + labs(y="mRNA expression")
+```
+```{r}
+plot_factor(MOFAobject, 
+            factors = c(1), 
+            color_by = "ACTR3",
+            add_violin = T,
+            group_by = "IMS",
+            show_missing = T,
+            add_boxplot = T,
+            scale = T,
+            dot_size = 3,
+            dodge = T,
+            stroke = 0.1
+)
+```
+
+```{r}
+plot_weights(MOFAobject,
+ view = "Genes",
+ factor = c(1),
+ nfeatures = 1,
+ manual = c('GBP1', 'ACTR3', "CX3CL1" , 'VIM', 'SYNCRIP', 'ASS1','GAPDH_Genes') ,
+ scale = F           # Scale weights from -1 to 1
+)
+```
+#Second Biological Process: GOBP_HUMORAL_IMMUNE_RESPONSE
+```{r}
+knitr::include_graphics("Enrichment_Results/GSEA_C5gobp.GseaPreranked.1679677560989/enplot_GOBP_HUMORAL_IMMUNE_RESPONSE_119.png")
+```
+```{r}
+plot_data_scatter(MOFAobject, 
+  view = "Genes",
+  factor = 1,  
+  features = c('PI3', 'S100A9', "KRT6A" , 'KLK7', 'SLPI', 'GAPDH_Genes','KLK5'),
+  sign = "positive",
+  color_by = "IMS"
+) + labs(y="mRNA expression")
+```
+
+```{r}
+plot_factor(MOFAobject, 
+            factors = c(1), 
+            color_by = "S100A9",
+            add_violin = T,
+            group_by = "IMS",
+            show_missing = T,
+            add_boxplot = T,
+            scale = T,
+            dot_size = 3,
+            dodge = T,
+            stroke = 0.1
+)
+```
+
+```{r}
+plot_weights(MOFAobject,
+ view = "Genes",
+ factor = c(1),
+ nfeatures = 1,
+ manual = c('PI3', 'S100A9', "KRT6A" , 'KLK7', 'SLPI', 'GAPDH_Genes','KLK5') ,
+ scale = F           # Scale weights from -1 to 1
+)
+```
+#Protein
+#First Biological Process: GOBP_RESPONSE_TO_CYTOKINE
+```{r}
+knitr::include_graphics("Enrichment_Results/Protein_C5gobp.GseaPreranked.1679677577693/enplot_GOBP_RESPONSE_TO_CYTOKINE_37.png")
+```
+
+```{r}
+plot_data_scatter(MOFAobject, 
+  view = "Protein",
+  factor = 1,  
+  features = c('LYN', 'SIRPA', "TP53" , 'SYK', 'CD274', 'CD44_Protein','PAX6' , 'KIT_Protein' , "TFRC_Protein"),
+  sign = "positive",
+  color_by = "IMS"
+) + labs(y="Protein expression")
+```
+
+```{r}
+plot_factor(MOFAobject, 
+            factors = c(1), 
+            color_by = "LYN",
+            add_violin = T,
+            group_by = "IMS",
+            show_missing = T,
+            add_boxplot = T,
+            scale = T,
+            dot_size = 3,
+            dodge = T,
+            stroke = 0.1
+)
+```
+
+```{r}
+plot_weights(MOFAobject,
+ view = "Protein",
+ factor = c(1),
+ nfeatures = 1,
+ manual = c('LYN', 'SIRPA', "TP53" , 'SYK', 'CD274', 'CD44_Protein','PAX6' , 'KIT_Protein' , "TFRC_Protein") ,
+ scale = F           # Scale weights from -1 to 1
+)
+```
+#Second Pathway: REACTOME_CYTOKINE_SIGNALING_IN_IMMUNE_SYSTEM
+```{r}
+knitr::include_graphics("Enrichment_Results/Protein_C5gobp.GseaPreranked.1679677577693/enplot_GOBP_LYMPHOCYTE_APOPTOTIC_PROCESS_29.png")
+```
+
+```{r}
+plot_data_scatter(MOFAobject, 
+  view = "Protein",
+  factor = 1,  
+  features = c('IDO1_Protein','CASP7', 'AURKB', 'TP53','CHEK2'),
+  sign = "positive",
+  color_by = "IMS"
+) + labs(y="Protein expression")
+```
+```{r}
+plot_factor(MOFAobject, 
+            factors = c(1), 
+            color_by = "AURKB",
+            add_violin = T,
+            group_by = "IMS",
+            show_missing = T,
+            add_boxplot = T,
+            scale = T,
+            dot_size = 3,
+            dodge = T,
+            stroke = 0.1
+)
+```
+
+```{r}
+plot_weights(MOFAobject,
+ view = "Protein",
+ factor = c(1),
+ nfeatures = 1,
+ manual = c('IDO1_Protein','CASP7', 'AURKB', 'TP53','CHEK2') ,
+ scale = F           # Scale weights from -1 to 1
+)
+```
+#miRNA
+#First Function: Immune Response
+
+```{r}
+plot_data_scatter(MOFAobject, 
+  view = "miRNA",
+  factor = 1,  
+  features = c('hsa-mir-186','hsa-mir-203a','hsa-mir-362','hsa-mir-9-1',
+               'hsa-mir-92a-1','hsa-mir-203b','hsa-mir-146b','hsa-mir-196b',
+               'hsa-mir-9-2','hsa-mir-210'),
+  sign = "positive",
+  color_by = "IMS"
+) + labs(y="miRNA expression")
+```
+```{r}
+plot_factor(MOFAobject, 
+            factors = c(1), 
+            color_by = "hsa-mir-186",
+            add_violin = T,
+            group_by = "IMS",
+            show_missing = T,
+            add_boxplot = T,
+            scale = T,
+            dot_size = 3,
+            dodge = T,
+            stroke = 0.1
+)
+```
+
+```{r}
+plot_weights(MOFAobject,
+ view = "miRNA",
+ factor = c(1),
+ nfeatures = 1,
+ manual = c('hsa-mir-186','hsa-mir-203a','hsa-mir-362','hsa-mir-9-1',
+               'hsa-mir-92a-1','hsa-mir-203b','hsa-mir-146b','hsa-mir-196b',
+               'hsa-mir-9-2','hsa-mir-210') ,
+ scale = F           # Scale weights from -1 to 1
+)
+```
+#Second Function: T-Cell Activation
+
+```{r}
+plot_data_scatter(MOFAobject, 
+  view = "miRNA",
+  factor = 1,  
+  features = c("hsa-mir-223","hsa-mir-146a","hsa-mir-18a","hsa-mir-155","hsa-mir-31"),
+  sign = "positive",
+  color_by = "IMS"
+) + labs(y="miRNA expression")
+```
+```{r}
+plot_factor(MOFAobject, 
+            factors = c(1), 
+            color_by = "hsa-mir-223",
+            add_violin = T,
+            group_by = "IMS",
+            show_missing = T,
+            add_boxplot = T,
+            scale = T,
+            dot_size = 3,
+            dodge = T,
+            stroke = 0.1
+)
+```
+
+```{r}
+plot_weights(MOFAobject,
+ view = "miRNA",
+ factor = c(1),
+ nfeatures = 1,
+ manual = c("hsa-mir-223","hsa-mir-146a","hsa-mir-18a","hsa-mir-155","hsa-mir-31") ,
+ scale = F           # Scale weights from -1 to 1
+)
+```
+
+#2.	Cell cycle and Mitotic division.
+#mRNA
+#REACTOME_CELL_CYCLE_MITOTIC
+
+#Protein
+#First Pathway: REACTOME_CELL_CYCLE_MITOTIC
+```{r}
+knitr::include_graphics("Enrichment_Results/Protein_Reactome.GseaPreranked.1679677623172/enplot_REACTOME_CELL_CYCLE_MITOTIC_161.png")
+```
+
+```{r}
+plot_data_scatter(MOFAobject, 
+  view = "Protein",
+  factor = 1,  
+  features = c('CCNE1', 'LYN', "FOXM1" , 'CCNB1', 'CDK1', 'PLK1','AURKB' , 'TP53' , "AURKA"),
+  sign = "positive",
+  color_by = "IMS"
+) + labs(y="mRNA expression")
+```
+
+```{r}
+plot_factor(MOFAobject, 
+            factors = c(1), 
+            color_by = "CCNE1",
+            add_violin = T,
+            group_by = "IMS",
+            show_missing = T,
+            add_boxplot = T,
+            scale = T,
+            dot_size = 3,
+            dodge = T,
+            stroke = 0.1
+)
+```
+
+```{r}
+plot_weights(MOFAobject,
+ view = "Protein",
+ factor = c(1),
+ nfeatures = 1,
+ manual = c('CCNE1', 'LYN', "FOXM1" , 'CCNB1', 'CDK1', 'PLK1','AURKB' , 'TP53' , "AURKA") ,
+ scale = F           # Scale weights from -1 to 1
+)
+```
+#Second Pathway: REACTOME_CELL_CYCLE_CHECKPOINTS
+
+```{r}
+knitr::include_graphics("Enrichment_Results/Protein_Reactome.GseaPreranked.1679677623172/enplot_REACTOME_CELL_CYCLE_CHECKPOINTS_165.png")
+```
+
+#miRNA
+#First Function: Cell Cycle
+```{r}
+plot_data_scatter(MOFAobject, 
+  view = "miRNA",
+  factor = 1,  
+  features = c("hsa-mir-24-1","hsa-mir-19b-1","hsa-mir-9-1","hsa-mir-221","hsa-mir-20a","hsa-mir-17","hsa-mir-92a-1","hsa-mir-19b-2","hsa-mir-31"),
+  sign = "positive",
+  color_by = "IMS"
+) + labs(y="miRNA expression")
+```
+```{r}
+plot_factor(MOFAobject, 
+            factors = c(1), 
+            color_by = 'hsa-mir-24-1',
+            add_violin = T,
+            group_by = "IMS",
+            show_missing = T,
+            add_boxplot = T,
+            scale = T,
+            dot_size = 3,
+            dodge = T,
+            stroke = 0.1
+)
+```
+
+```{r}
+plot_weights(MOFAobject,
+ view = "miRNA",
+ factor = c(1),
+ nfeatures = 1,
+ manual = c("hsa-mir-24-1","hsa-mir-19b-1","hsa-mir-9-1","hsa-mir-221","hsa-mir-20a","hsa-mir-17","hsa-mir-92a-1","hsa-mir-19b-2","hsa-mir-31") ,
+ scale = F           # Scale weights from -1 to 1
+)
+```
+#3.	Cell migration
+#mRNA
+#First Biological Process: GOBP_POSITIVE_REGULATION_OF_MONONUCLEAR_CELL_MIGRATION
+```{r}
+knitr::include_graphics("Enrichment_Results/GSEA_C5gobp.GseaPreranked.1679677560989/enplot_GOBP_POSITIVE_REGULATION_OF_MONONUCLEAR_CELL_MIGRATION_113.png")
+```
+
+```{r}
+plot_data_scatter(MOFAobject, 
+  view = "Genes",
+  factor = 1,  
+  features = c('CXCL10', 'LGMN', "CALR" , 'CCL5', 'CD47', 'APP','S100A7'),
+  sign = "positive",
+  color_by = "IMS"
+) + labs(y="mRNA expression")
+```
+
+```{r}
+plot_factor(MOFAobject, 
+            factors = c(1), 
+            color_by = "CXCL10",
+            add_violin = T,
+            group_by = "IMS",
+            show_missing = T,
+            add_boxplot = T,
+            scale = T,
+            dot_size = 3,
+            dodge = T,
+            stroke = 0.1
+)
+```
+
+```{r}
+plot_weights(MOFAobject,
+ view = "Genes",
+ factor = c(1),
+ nfeatures = 1,
+ manual = c('CXCL10', 'LGMN', "CALR" , 'CCL5', 'CD47', 'APP','S100A7') ,
+ scale = F           # Scale weights from -1 to 1
+)
+```
+
+#Protein
+#First Biological Process
+
+#miRNA
+#First Function: 
+
+4.	Response to microbial infection.
+#mRNA
+#First Pathway: REACTOME_INTERFERON_GAMMA_SIGNALING
+```{r}
+knitr::include_graphics("Enrichment_Results/GSEA_Reactome.GseaPreranked.1679677635779/enplot_REACTOME_INFLUENZA_INFECTION_265.png")
+```
+
+```{r}
+plot_data_scatter(MOFAobject, 
+  view = "Genes",
+  factor = 1,  
+  features = c('KPNA4', 'RPS7', "KPNA2" , 'CALR', 'RPS27A', 'IPO5','RPS19', "RAN" , "RPS12"),
+  sign = "positive",
+  color_by = "IMS"
+) + labs(y="mRNA expression")
+```
+
+```{r}
+plot_factor(MOFAobject, 
+            factors = c(1), 
+            color_by = "KPNA4",
+            add_violin = T,
+            group_by = "IMS",
+            show_missing = T,
+            add_boxplot = T,
+            scale = T,
+            dot_size = 3,
+            dodge = T,
+            stroke = 0.1
+)
+```
+
+```{r}
+plot_weights(MOFAobject,
+ view = "Genes",
+ factor = c(1),
+ nfeatures = 1,
+ manual = c('KPNA4', 'RPS7', "KPNA2" , 'CALR', 'RPS27A', 'IPO5','RPS19', "RAN" , "RPS12") ,
+ scale = F           # Scale weights from -1 to 1
+)
+```
+#Second Pathway: GOBP_ANTIMICROBIAL_HUMORAL_RESPONSE
+```{r}
+knitr::include_graphics("Enrichment_Results/GSEA_C5gobp.GseaPreranked.1679677560989/enplot_GOBP_ANTIMICROBIAL_HUMORAL_RESPONSE_83.png")
+```
+
+```{r}
+plot_data_scatter(MOFAobject, 
+  view = "Genes",
+  factor = 1,  
+  features = c('PI3','S100A9', 'KRT6A', 'KLK7','SLPI', 'GAPDH_Genes', 'KLK5', 'CXCL10'),
+  sign = "positive",
+  color_by = "IMS"
+) + labs(y="mRNA expression")
+```
+```{r}
+plot_weights(MOFAobject,
+ view = "Genes",
+ factor = c(1),
+ nfeatures = 1,
+ manual = c('PI3','S100A9', 'KRT6A', 'KLK7','SLPI', 'GAPDH_Genes', 'KLK5', 'CXCL10') ,
+ scale = F           # Scale weights from -1 to 1
+)
+```
+
+#Protein
+#First Biological Process: GOBP_RESPONSE_TO_BACTERIUM
+```{r}
+knitr::include_graphics("Enrichment_Results/Protein_C5gobp.GseaPreranked.1679677577693/enplot_GOBP_RESPONSE_TO_BACTERIUM_3.png")
+```
+
+```{r}
+plot_data_scatter(MOFAobject, 
+  view = "Protein",
+  factor = 1,  
+  features = c('LYN', 'IDO1_Protein', "SIRPA" , 'CASP7', 'SOD2_Protein', 'SYK','CD274' , 'PRKCA' , "CD4"),
+  sign = "positive",
+  color_by = "IMS"
+) + labs(y="Protein expression")
+```
+
+
+```{r}
+plot_weights(MOFAobject,
+ view = "Protein",
+ factor = c(1),
+ nfeatures = 1,
+ manual = c('LYN', 'IDO1_Protein', "SIRPA" , 'CASP7', 'SOD2_Protein', 'SYK','CD274' , 'PRKCA' , "CD4") ,
+ scale = F           # Scale weights from -1 to 1
+)
+```
+
+#miRNA
+#First Function: Response to Hypoxia
+
+```{r}
+plot_data_scatter(MOFAobject, 
+  view = "miRNA",
+  factor = 1,  
+  features = c("hsa-mir-137","hsa-mir-210","hsa-mir-138-1","hsa-mir-155","hsa-mir-138-2","hsa-mir-18a","hsa-mir-196b"),
+  sign = "positive",
+  color_by = "IMS"
+) + labs(y="miRNA expression")
+```
+```{r}
+plot_factor(MOFAobject, 
+            factors = c(1), 
+            color_by = 'hsa-mir-138-2',
+            add_violin = T,
+            group_by = "IMS",
+            show_missing = T,
+            add_boxplot = T,
+            scale = T,
+            dot_size = 3,
+            dodge = T,
+            stroke = 0.1
+)
+```
+
+```{r}
+plot_weights(MOFAobject,
+ view = "miRNA",
+ factor = c(1),
+ nfeatures = 1,
+ manual = c("hsa-mir-137","hsa-mir-210","hsa-mir-138-1","hsa-mir-155","hsa-mir-138-2","hsa-mir-18a","hsa-mir-196b") ,
+ scale = F           # Scale weights from -1 to 1
+)
+```
+
+#b.	Features Negative to factor one
+#1.	Lipid metabolism
+#mRNA
+#First Pathway: REACTOME_SPHINGOLIPID_METABOLISM
+```{r}
+knitr::include_graphics("Enrichment_Results/GSEA_Reactome.GseaPreranked.1679677635779/enplot_REACTOME_SPHINGOLIPID_METABOLISM_283.png")
+```
+
+```{r}
+plot_data_scatter(MOFAobject, 
+  view = "Genes",
+  factor = 1,  
+  features = c('DEGS2', 'UGCG', "CERS4" , 'ASAH1', 'ARSD', 'CERS6','SPTLC2'),
+  sign = "negative",
+  color_by = "IMS"
+) + labs(y="mRNA expression")
+```
+```{r}
+plot_factor(MOFAobject, 
+            factors = c(1), 
+            color_by = "DEGS2",
+            add_violin = T,
+            group_by = "IMS",
+            show_missing = T,
+            add_boxplot = T,
+            scale = T,
+            dot_size = 3,
+            dodge = T,
+            stroke = 0.1
+)
+```
+
+```{r}
+plot_weights(MOFAobject,
+ view = "Genes",
+ factor = c(1),
+ nfeatures = 1,
+ manual = c('DEGS2', 'UGCG', "CERS4" , 'ASAH1', 'ARSD', 'CERS6','SPTLC2') ,
+ scale = F           # Scale weights from -1 to 1
+)
+```
+
+#Second Pathway: REACTOME_METABOLISM_OF_LIPIDS
+```{r}
+knitr::include_graphics("Enrichment_Results/GSEA_Reactome.GseaPreranked.1679677635779/enplot_REACTOME_METABOLISM_OF_LIPIDS_311.png")
+```
+
+```{r}
+plot_data_scatter(MOFAobject, 
+  view = "Genes",
+  factor = 1,  
+  features = c('SLC44A4', 'DEGS2', "INPP4B_Genes" , 'UGCG', 'STARD10', 'CYP4B1','HSD17B4', "HACD3" , "ELOVL5"),
+  sign = "negative",
+  color_by = "IMS"
+) + labs(y="mRNA expression")
+```
+```{r}
+plot_factor(MOFAobject, 
+            factors = c(1), 
+            color_by = "SLC44A4",
+            add_violin = T,
+            group_by = "IMS",
+            show_missing = T,
+            add_boxplot = T,
+            scale = T,
+            dot_size = 3,
+            dodge = T,
+            stroke = 0.1
+)
+```
+
+```{r}
+plot_weights(MOFAobject,
+ view = "Genes",
+ factor = c(1),
+ nfeatures = 1,
+ manual = c('SLC44A4', 'DEGS2', "INPP4B_Genes" , 'UGCG', 'STARD10', 'CYP4B1','HSD17B4', "HACD3" , "ELOVL5") ,
+ scale = F           # Scale weights from -1 to 1
+)
+```
+#First Biologoical Process: GOBP_MEMBRANE_LIPID_BIOSYNTHETIC_PROCESS
+```{r}
+knitr::include_graphics("Enrichment_Results/GSEA_C5gobp.GseaPreranked.1679677560989/enplot_GOBP_MEMBRANE_LIPID_BIOSYNTHETIC_PROCESS_121.png")
+```
+
+```{r}
+plot_data_scatter(MOFAobject, 
+  view = "Genes",
+  factor = 1,  
+  features = c('DEGS2', 'UGCG', "HACD3" , 'ELOVL5', 'SCCPDH', 'CERS4','ASAH1'),
+  sign = "negative",
+  color_by = "IMS"
+) + labs(y="mRNA expression")
+```
+#Protein
+#First Biological Process: GOBP_LIPID_METABOLIC_PROCESS
+
+#miRNA
+#First Function: Lipid Metabolism
+```{r}
+plot_data_scatter(MOFAobject, 
+  view = "miRNA",
+  factor = 1,  
+  features = c("hsa-mir-125a","hsa-mir-29c","hsa-mir-33b","hsa-mir-103a-2","hsa-mir-103a-1","hsa-mir-10b","hsa-mir-196a-2","hsa-mir-196a-1","hsa-mir-375"),
+  sign = "negative",
+  color_by = "IMS"
+) + labs(y="miRNA expression")
+```
+```{r}
+plot_factor(MOFAobject, 
+            factors = c(1), 
+            color_by = 'hsa-mir-29c',
+            add_violin = T,
+            group_by = "IMS",
+            show_missing = T,
+            add_boxplot = T,
+            scale = T,
+            dot_size = 3,
+            dodge = T,
+            stroke = 0.1
+)
+```
+
+```{r}
+plot_weights(MOFAobject,
+ view = "miRNA",
+ factor = c(1),
+ nfeatures = 1,
+ manual = c("hsa-mir-125a","hsa-mir-29c","hsa-mir-33b","hsa-mir-103a-2","hsa-mir-103a-1","hsa-mir-10b","hsa-mir-196a-2","hsa-mir-196a-1","hsa-mir-375") ,
+ scale = F           # Scale weights from -1 to 1
+)
+```
+2.	Hormone related pathways
+#mRNA
+#First Biological Process: GOBP_MAMMARY_GLAND_EPITHELIUM_DEVELOPMENT
+```{r}
+knitr::include_graphics("Enrichment_Results/GSEA_C5gobp.GseaPreranked.1679677560989/enplot_GOBP_MAMMARY_GLAND_EPITHELIUM_DEVELOPMENT_123.png")
+```
+
+```{r}
+plot_data_scatter(MOFAobject, 
+  view = "Genes",
+  factor = 1,  
+  features = c('ESR1_Genes', 'ERBB4', "GATA3_Genes" , 'AR_Genes', 'PGR_Genes', 'ZNF703','PRLR' , 'CCND1_Genes' , "TBX3"),
+  sign = "negative",
+  color_by = "IMS"
+) + labs(y="mRNA expression")
+```
+
+```{r}
+plot_factor(MOFAobject, 
+            factors = c(1), 
+            color_by = "ESR1_Genes",
+            add_violin = T,
+            group_by = "IMS",
+            show_missing = T,
+            add_boxplot = T,
+            scale = T,
+            dot_size = 3,
+            dodge = T,
+            stroke = 0.1
+)
+```
+
+```{r}
+plot_weights(MOFAobject,
+ view = "Genes",
+ factor = c(1),
+ nfeatures = 1,
+ manual = c('ESR1_Genes', 'ERBB4', "GATA3_Genes" , 'AR_Genes', 'PGR_Genes', 'ZNF703','PRLR' , 'CCND1_Genes' , "TBX3") ,
+ scale = F           # Scale weights from -1 to 1
+)
+```
+#Protein
+#First Biological Process: GOBP_MAMMARY_GLAND_EPITHELIUM_DEVELOPMENT
+```{r}
+knitr::include_graphics("Enrichment_Results/Protein_C5gobp.GseaPreranked.1679677577693/enplot_GOBP_MAMMARY_GLAND_EPITHELIUM_DEVELOPMENT_43.png")
+```
+
+```{r}
+plot_data_scatter(MOFAobject, 
+  view = "Protein",
+  factor = 1,  
+  features = c('ESR1_Protein', 'GATA3_Protein', "AR_Protein" , 'PGR_Protein', 'MAPK1_Protein'),
+  sign = "negative",
+  color_by = "IMS"
+) + labs(y="Protein expression")
+```
+
+```{r}
+plot_factor(MOFAobject, 
+            factors = c(1), 
+            color_by = "ESR1_Protein",
+            add_violin = T,
+            group_by = "IMS",
+            show_missing = T,
+            add_boxplot = T,
+            scale = T,
+            dot_size = 3,
+            dodge = T,
+            stroke = 0.1
+)
+```
+
+```{r}
+plot_weights(MOFAobject,
+ view = "Protein",
+ factor = c(1),
+ nfeatures = 1,
+ manual = c('ESR1_Protein', 'GATA3_Protein', "AR_Protein" , 'PGR_Protein', 'MAPK1_Protein') ,
+ scale = F           # Scale weights from -1 to 1
+)
+```
+```{r}
+sessionInfo()
+```
+
